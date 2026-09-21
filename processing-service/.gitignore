@@ -1,0 +1,8 @@
+venv/
+.ultralytics/
+models/*.pt
+outputs/
+runtime/
+test-images/*.png
+__pycache__/
+*.pyc
