@@ -23,7 +23,9 @@ que un agente de código los use como guía de implementación:
 - `ROADMAP.md` — orden de trabajo sugerido, en fases, con criterio de "hecho"
   para cada una.
 - `SETUP.md` — instrucciones para crear el entorno, probar la GPU y levantar
-  el servicio de procesamiento local.
+  el servicio de procesamiento local y el frontend.
+- `DEPLOY.md` — instrucciones para buildear y correr `processing-service` con
+  Docker y GPU.
 
 ## Instrucciones generales para el agente
 

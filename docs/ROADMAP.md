@@ -61,3 +61,24 @@ local.
   servidor con GPU en la nube.
 - **Hecho cuando**: el servicio corre igual dentro de un container Docker
   con acceso a GPU (por ejemplo `--gpus all`).
+
+## Fase 8 — Testing y validación con casos reales
+
+**Objetivo**: cerrar dos huecos que quedaron pendientes de todas las fases
+anteriores: nunca se probó con fotos reales (solo placeholders sintéticos
+de la Fase 1), y no hay ningún test automatizado de la lógica de negocio
+más frágil (merge/split, renumeración, generación de paletas).
+
+- Probar el pipeline completo con 5-10 fotos reales (no sintéticas),
+  variadas: retratos, paisajes, objetos con fondos complejos, imágenes de
+  baja/alta resolución.
+- Evaluar si la calidad de segmentación es usable en la práctica, o si hay
+  que ajustar parámetros (num_zones, min_zone_area_px, umbral del modelo).
+- Agregar tests automatizados (no exhaustivos, sí de la lógica crítica):
+  reglas de merge (color/número que se conserva, umbral del 20%), reglas
+  de split (pieza mayor conserva identidad), renumeración contigua sin
+  huecos, y generación de paletas sugeridas.
+- **Hecho cuando**: hay evidencia concreta (capturas o archivos de salida)
+  de que el pipeline funciona bien con fotos reales, y existe una suite de
+  tests que corre en un solo comando y cubre las reglas de negocio de
+  merge/split/renumeración/paletas.

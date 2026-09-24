@@ -1,8 +1,11 @@
 # Guia para levantar el proyecto
 
-Estado actual: estan implementadas la Fase 1 y la Fase 2 del roadmap para
-`processing-service`. Todavia no hay frontend, base de datos, endpoints de
-merge/split ni export PDF.
+Estado actual: estan implementadas las Fases 1 a 6 del roadmap:
+`processing-service` con segmentacion por GPU, API `/segment`, endpoints de
+merge/split, frontend Next.js con upload/preview, editor de paleta, edicion
+manual de zonas, persistencia SQLite y export PDF.
+
+Para correr `processing-service` dockerizado con GPU, ver `docs/DEPLOY.md`.
 
 ## Requisitos
 
@@ -26,7 +29,7 @@ df -h .
 Desde la raiz del repo:
 
 ```bash
-cd /home/ro/Desktop/ColorWind
+cd /home/ro/Desktop/proyects/ColorWind
 ```
 
 Si el entorno ya existe, reusarlo:
@@ -96,7 +99,7 @@ El script debe loggear `device=cuda:0` y la GPU detectada. Genera salidas en:
 Desde `processing-service`:
 
 ```bash
-cd /home/ro/Desktop/ColorWind/processing-service
+cd /home/ro/Desktop/proyects/ColorWind/processing-service
 venv/bin/python -m uvicorn app.main:app --host 127.0.0.1 --port 8000
 ```
 
@@ -113,7 +116,7 @@ En esta maquina `npm` no esta disponible en PATH, pero si `pnpm`. Desde la
 raiz del repo:
 
 ```bash
-cd /home/ro/Desktop/ColorWind/web
+cd /home/ro/Desktop/proyects/ColorWind/web
 pnpm install --store-dir /tmp/pnpm-store
 pnpm dev
 ```
@@ -139,7 +142,7 @@ claro si el servicio de procesamiento no esta corriendo.
 En otra terminal, desde la raiz del repo:
 
 ```bash
-cd /home/ro/Desktop/ColorWind
+cd /home/ro/Desktop/proyects/ColorWind
 IMAGE_B64="$(base64 -w 0 processing-service/test-images/flat-illustration.png)"
 
 curl -s http://127.0.0.1:8000/segment \
@@ -207,10 +210,10 @@ PY
 ## Notas utiles
 
 - El servicio mantiene el modelo FastSAM cargado una sola vez por proceso.
-- El estado de proyectos generado por `/segment` queda en memoria del proceso
-  FastAPI. Si se reinicia uvicorn, esos `project_id` se pierden. Esto es
-  suficiente para Fase 2; SQLite pertenece a la web app y se implementara en
-  fases posteriores.
+- El estado transitorio generado por `/segment` queda en memoria del proceso
+  FastAPI. Si se reinicia uvicorn, esos `project_id` se pierden.
+- La web app persiste el proyecto actual y las paletas custom en SQLite, en
+  `web/db/app.db`. Ese archivo es local y esta ignorado por git.
 - En el entorno de Codex, el acceso a GPU y a `127.0.0.1` puede requerir
   permisos escalados por sandbox. En una terminal normal del usuario no deberia
   hacer falta.

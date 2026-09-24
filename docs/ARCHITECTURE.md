@@ -94,9 +94,15 @@ projects
 palettes
   id            TEXT PRIMARY KEY (uuid)
   name          TEXT
+  num_zones     INTEGER     -- cantidad de zonas para la que fue creada
   colors_json   TEXT        -- {numero: hex}
   created_at    DATETIME
 ```
+
+Al aplicar una paleta guardada a una imagen nueva: si su `num_zones`
+coincide con el de la imagen actual, se aplica directo; si no coincide, se
+puede ofrecer igual pero marcando que faltan/sobran colores respecto a las
+zonas reales de esa imagen.
 
 - No se modela `users` todavía: mientras sea de uso personal, todo es
   single-tenant (sin login). Si más adelante se abre a otros usuarios, se

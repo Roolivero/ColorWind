@@ -13,10 +13,12 @@ from typing import Any, Literal
 import cv2
 import numpy as np
 import torch
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Response
 from pydantic import BaseModel, Field
 
+from app.geometry import GeometryError, merge_zones, should_confirm_merge, split_zone
 from app.palette import suggested_palettes
+from app.pdf_export import generate_pdf
 from segment_image import ROOT, SegmentParams, load_model, require_cuda, segment_path
 
 
@@ -46,6 +48,33 @@ class SegmentResponse(BaseModel):
     zones_svg: str
     zones_geojson: dict[str, Any]
     suggested_palettes: list[PaletteResponse]
+
+
+class MergeRequest(BaseModel):
+    project_id: str
+    zone_ids: list[str] = Field(min_length=2, max_length=2)
+    palette_colors: dict[str, str] | None = None
+    keep_zone_id: str | None = None
+
+
+class SplitRequest(BaseModel):
+    project_id: str
+    zone_id: str
+    split_line: list[list[float]] = Field(min_length=2)
+    palette_colors: dict[str, str] | None = None
+
+
+class MergeConfirmationResponse(BaseModel):
+    requires_confirmation: bool
+    reason: Literal["area_difference_below_threshold"]
+    candidates: list[str]
+
+
+class ExportPdfRequest(BaseModel):
+    project_id: str
+    palette: dict[str, str]
+    paper_size: Literal["A4", "Letter"]
+    orientation: Literal["portrait", "landscape"]
 
 
 @asynccontextmanager
@@ -127,15 +156,18 @@ def zones_to_geojson(width: int, height: int, mode: str, zones: list[dict[str, A
         if ring and ring[0] != ring[-1]:
             ring.append(ring[0])
         zone_id = str(zone["id"])
+        properties = {
+            "zone_id": zone_id,
+            "area_px": zone["area_px"],
+            "bbox": zone["bbox"],
+        }
+        if zone.get("requires_manual_color"):
+            properties["requires_manual_color"] = True
         features.append(
             {
                 "type": "Feature",
                 "id": zone_id,
-                "properties": {
-                    "zone_id": zone_id,
-                    "area_px": zone["area_px"],
-                    "bbox": zone["bbox"],
-                },
+                "properties": properties,
                 "geometry": {
                     "type": "Polygon",
                     "coordinates": [ring],
@@ -151,6 +183,64 @@ def zones_to_geojson(width: int, height: int, mode: str, zones: list[dict[str, A
         },
         "features": features,
     }
+
+
+def project_or_404(project_id: str) -> dict[str, Any]:
+    project = PROJECTS.get(project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="project_id not found")
+    return project
+
+
+def original_palette(project: dict[str, Any]) -> dict[str, str]:
+    palettes = project.get("original_suggested_palettes") or project.get("suggested_palettes") or []
+    if not palettes:
+        return {}
+    return {str(key): value for key, value in palettes[0].get("colors", {}).items()}
+
+
+def fallback_palette(project: dict[str, Any]) -> dict[str, str]:
+    return {
+        str(key): value
+        for key, value in (project.get("palette_colors") or original_palette(project)).items()
+    }
+
+
+def operation_palettes(project: dict[str, Any], palette_colors: dict[str, str]) -> list[dict[str, Any]]:
+    return [
+        {"name": "Paleta actual", "colors": palette_colors},
+        *(project.get("original_suggested_palettes") or []),
+    ]
+
+
+def update_project_geometry(
+    project: dict[str, Any],
+    zones: list[dict[str, Any]],
+    palette_colors: dict[str, str],
+) -> SegmentResponse:
+    image_info = project["image"]
+    width = int(image_info["width"])
+    height = int(image_info["height"])
+    zones_svg = zones_to_svg(width, height, zones)
+    zones_geojson = zones_to_geojson(width, height, project["mode"], zones)
+    palettes = operation_palettes(project, palette_colors)
+
+    project.update(
+        {
+            "zones": zones,
+            "palette_colors": palette_colors,
+            "zones_svg": zones_svg,
+            "zones_geojson": zones_geojson,
+            "suggested_palettes": palettes,
+            "updated_at": datetime.now(UTC).isoformat(),
+        }
+    )
+    return SegmentResponse(
+        project_id=project["project_id"],
+        zones_svg=zones_svg,
+        zones_geojson=zones_geojson,
+        suggested_palettes=palettes,
+    )
 
 
 @app.post("/segment", response_model=SegmentResponse)
@@ -181,6 +271,7 @@ def segment(request: SegmentRequest) -> SegmentResponse:
     zones_svg = zones_to_svg(width, height, zones)
     zones_geojson = zones_to_geojson(width, height, request.mode, zones)
     palettes = suggested_palettes(image_bgr, len(zones))
+    palette_colors = palettes[0]["colors"] if palettes else {}
 
     PROJECTS[project_id] = {
         "project_id": project_id,
@@ -190,6 +281,8 @@ def segment(request: SegmentRequest) -> SegmentResponse:
         "zones_svg": zones_svg,
         "zones_geojson": zones_geojson,
         "suggested_palettes": palettes,
+        "original_suggested_palettes": palettes,
+        "palette_colors": palette_colors,
         "created_at": datetime.now(UTC).isoformat(),
         "metrics": payload["metrics"],
         "device": payload["device"],
@@ -208,4 +301,90 @@ def segment(request: SegmentRequest) -> SegmentResponse:
         zones_svg=zones_svg,
         zones_geojson=zones_geojson,
         suggested_palettes=palettes,
+    )
+
+
+@app.post("/zones/merge", response_model=SegmentResponse | MergeConfirmationResponse)
+def merge(request: MergeRequest) -> SegmentResponse | MergeConfirmationResponse:
+    project = project_or_404(request.project_id)
+    zone_ids = [str(zone_id) for zone_id in request.zone_ids]
+
+    try:
+        if should_confirm_merge(project["zones"], zone_ids):
+            if not request.keep_zone_id:
+                return MergeConfirmationResponse(
+                    requires_confirmation=True,
+                    reason="area_difference_below_threshold",
+                    candidates=zone_ids,
+                )
+            if str(request.keep_zone_id) not in zone_ids:
+                raise GeometryError("keep_zone_id debe ser una de las zonas a fusionar.")
+
+        zones, palette_colors = merge_zones(
+            project["zones"],
+            zone_ids,
+            palette_colors=request.palette_colors,
+            fallback_colors=fallback_palette(project),
+            keep_zone_id=request.keep_zone_id,
+        )
+    except GeometryError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    LOGGER.info("project_id=%s merge=%s zones=%s", request.project_id, zone_ids, len(zones))
+    return update_project_geometry(project, zones, palette_colors)
+
+
+@app.post("/zones/split", response_model=SegmentResponse)
+def split_zone_endpoint(request: SplitRequest) -> SegmentResponse:
+    project = project_or_404(request.project_id)
+    try:
+        zones, palette_colors = split_zone(
+            project["zones"],
+            request.zone_id,
+            request.split_line,
+            palette_colors=request.palette_colors,
+            fallback_colors=fallback_palette(project),
+            original_palette=original_palette(project),
+        )
+    except GeometryError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    LOGGER.info("project_id=%s split=%s zones=%s", request.project_id, request.zone_id, len(zones))
+    return update_project_geometry(project, zones, palette_colors)
+
+
+@app.post("/export/pdf")
+def export_pdf(request: ExportPdfRequest) -> Response:
+    project = project_or_404(request.project_id)
+    image_info = project["image"]
+
+    try:
+        result = generate_pdf(
+            palette={str(key): value for key, value in request.palette.items()},
+            image_width=int(image_info["width"]),
+            image_height=int(image_info["height"]),
+            zones=project["zones"],
+            paper_size=request.paper_size,
+            orientation=request.orientation,
+        )
+    except Exception as exc:
+        LOGGER.exception("PDF export failed")
+        raise HTTPException(status_code=500, detail="Could not generate PDF") from exc
+
+    project["numbered_svg"] = result.numbered_svg
+    LOGGER.info(
+        "project_id=%s export_pdf paper=%s orientation=%s zones=%s seconds=%s",
+        request.project_id,
+        request.paper_size,
+        request.orientation,
+        len(project["zones"]),
+        result.elapsed_seconds,
+    )
+    return Response(
+        content=result.pdf_bytes,
+        media_type="application/pdf",
+        headers={
+            "Content-Disposition": f'attachment; filename="colorwind-{request.project_id[:8]}.pdf"',
+            "X-Generation-Seconds": str(result.elapsed_seconds),
+        },
     )
