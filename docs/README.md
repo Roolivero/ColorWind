@@ -24,6 +24,8 @@ que un agente de código los use como guía de implementación:
   para cada una.
 - `SETUP.md` — instrucciones para crear el entorno, probar la GPU y levantar
   el servicio de procesamiento local y el frontend.
+- `LOCAL_INSTALL.md` — guia corta para correr la app en una PC local, sin
+  Docker, pensada para uso privado o compartir con alguien de confianza.
 - `DEPLOY.md` — instrucciones para buildear y correr `processing-service` con
   Docker y GPU.
 

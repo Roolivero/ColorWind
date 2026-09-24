@@ -5,7 +5,9 @@ Estado actual: estan implementadas las Fases 1 a 6 del roadmap:
 merge/split, frontend Next.js con upload/preview, editor de paleta, edicion
 manual de zonas, persistencia SQLite y export PDF.
 
-Para correr `processing-service` dockerizado con GPU, ver `docs/DEPLOY.md`.
+Para una guia corta de instalacion local privada, ver
+`docs/LOCAL_INSTALL.md`. Para correr `processing-service` dockerizado con GPU,
+ver `docs/DEPLOY.md`.
 
 ## Requisitos
 
