@@ -149,7 +149,7 @@ IMAGE_B64="$(base64 -w 0 processing-service/test-images/flat-illustration.png)"
 
 curl -s http://127.0.0.1:8000/segment \
   -H "Content-Type: application/json" \
-  -d "{\"image_base64\":\"$IMAGE_B64\",\"mode\":\"color\",\"num_zones\":12,\"min_zone_area_px\":500}" \
+  -d "{\"image_base64\":\"$IMAGE_B64\",\"mode\":\"color\",\"num_colors\":12,\"detail_level\":0.5}" \
   | processing-service/venv/bin/python -m json.tool
 ```
 
@@ -190,8 +190,8 @@ for path, mode in cases:
         json={
             "image_base64": image,
             "mode": mode,
-            "num_zones": 12,
-            "min_zone_area_px": 500,
+            "num_colors": 12,
+            "detail_level": 0.5,
         },
     )
     response.raise_for_status()

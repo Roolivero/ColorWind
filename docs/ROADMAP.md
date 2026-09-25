@@ -65,19 +65,21 @@ local.
 ## Fase 8 — Testing y validación con casos reales
 
 **Objetivo**: cerrar dos huecos que quedaron pendientes de todas las fases
-anteriores: nunca se probó con fotos reales (solo placeholders sintéticos
-de la Fase 1), y no hay ningún test automatizado de la lógica de negocio
-más frágil (merge/split, renumeración, generación de paletas).
+anteriores: validar con imágenes reales del caso objetivo (especialmente
+line-art/coloring book, no solo placeholders sintéticos de la Fase 1), y
+agregar tests automatizados de la lógica de negocio más frágil
+(merge/split, renumeración, generación de paletas).
 
-- Probar el pipeline completo con 5-10 fotos reales (no sintéticas),
-  variadas: retratos, paisajes, objetos con fondos complejos, imágenes de
-  baja/alta resolución.
+- Probar el pipeline completo con 5-10 imágenes reales (no sintéticas),
+  variadas: line-art de animales/paisajes/flores y, como caso secundario,
+  fotos o ilustraciones color.
 - Evaluar si la calidad de segmentación es usable en la práctica, o si hay
-  que ajustar parámetros (num_zones, min_zone_area_px, umbral del modelo).
+  que ajustar parámetros (`num_colors`, `detail_level`, umbral del modelo).
 - Agregar tests automatizados (no exhaustivos, sí de la lógica crítica):
   reglas de merge (color/número que se conserva, umbral del 20%), reglas
-  de split (pieza mayor conserva identidad), renumeración contigua sin
-  huecos, y generación de paletas sugeridas.
+  de split (pieza mayor conserva `zone_id`, ambas piezas conservan
+  `paint_number`), renumeración contigua de zonas sin huecos, asignación de
+  `paint_number` repetible entre zonas y generación de paletas sugeridas.
 - **Hecho cuando**: hay evidencia concreta (capturas o archivos de salida)
   de que el pipeline funciona bien con fotos reales, y existe una suite de
   tests que corre en un solo comando y cubre las reglas de negocio de

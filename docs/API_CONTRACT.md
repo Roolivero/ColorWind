@@ -11,11 +11,25 @@ Segmenta una imagen y devuelve zonas + paleta sugerida.
 {
   "image_base64": "string",
   "mode": "color",
-  "num_zones": 12,
-  "min_zone_area_px": 500
+  "num_colors": 12,
+  "detail_level": 0.5
 }
 ```
-`mode` es `"color"` o `"bw"`.
+`mode` es `"color"` o `"bw"`. `num_colors` es la cantidad de números/colores
+de pintura (5–30 en la UI), y el backend intenta usar todos cuando hay
+suficientes zonas geométricas para repartirlos. `detail_level` es cualitativo
+(`0` = bajo, `0.5` = medio, `1` = alto): controla cuántas zonas geométricas
+intenta conservar el post-procesado, pero no promete una cantidad exacta de
+zonas.
+
+Implementación actual:
+
+- `mode="color"` usa FastSAM con GPU.
+- `mode="bw"` usa el pipeline line-art CPU de regiones cerradas
+  (`processing-service/app/lineart.py`): binarización adaptativa, cierre
+  morfológico de líneas, `connectedComponentsWithStats`, subdivisión SLIC
+  de zonas grandes, fusión interna de fragmentos chicos post-SLIC y
+  asignación de `paint_number` por coloreo de grafos.
 
 **Response**
 ```json
@@ -29,6 +43,15 @@ Segmenta una imagen y devuelve zonas + paleta sugerida.
   ]
 }
 ```
+Cada feature de `zones_geojson.features` tiene dos identificadores distintos:
+
+- `properties.zone_id`: id geométrico interno de la zona, usado para
+  fusionar/dividir.
+- `properties.paint_number`: número visible para pintar. Varios `zone_id`
+  pueden compartir el mismo `paint_number`.
+
+`suggested_palettes[].colors` se indexa por `paint_number`, no por
+`zone_id`.
 
 ## POST /zones/merge
 
@@ -46,11 +69,19 @@ Segmenta una imagen y devuelve zonas + paleta sugerida.
   editor de paleta). Si se envía, el backend la usa como base en vez de la
   paleta original, y solo recalcula lo necesario por el merge.
 - `keep_zone_id` (opcional): resuelve manualmente cuál de las dos zonas
-  conserva número/color, para el caso en que la diferencia de área entre
-  ambas sea menor al 20% (ver regla en `docs/FUNCTIONAL_SPEC.md`, paso 4).
-  Si no se envía y la diferencia de área es <20%, el backend responde
-  pidiendo esta confirmación en vez de decidir solo (ver más abajo). Si la
-  diferencia es ≥20%, este campo se ignora y gana la zona de mayor área.
+  conserva el `paint_number`, para el caso en que la diferencia de área
+  entre ambas sea menor al 20% y las zonas tengan números distintos (ver
+  regla en `docs/FUNCTIONAL_SPEC.md`, paso 4). Si no se envía y la
+  diferencia es <20%, el backend responde pidiendo esta confirmación en vez
+  de decidir solo (ver más abajo). Si la diferencia es ≥20%, este campo se
+  ignora y gana la zona de mayor área. Si ambas zonas ya comparten
+  `paint_number`, no se pide confirmación.
+- **Identificador resultante**: la zona fusionada conserva como `zone_id`
+  el valor de `keep_zone_id` (el que ganó, ya sea por área o por elección
+  manual del usuario tras la confirmación). El otro `zone_id` deja de
+  existir. Esto es lo que el resto del sistema (undo, referencias en la
+  DB) debe usar para identificar la zona resultante — no se genera un
+  `zone_id` nuevo en el merge.
 
 **Response (caso normal)**: mismo shape que `/segment` (zonas renumeradas +
 paleta actualizada, respetando `palette_colors` si vino en el request).
@@ -82,11 +113,11 @@ request agregando `keep_zone_id` con la elección del usuario.
 por el usuario. `palette_colors` (opcional): misma función que en
 `/zones/merge`.
 
-De las dos piezas resultantes, la de **mayor área** conserva el número y
-color de la zona original; la de menor área es la nueva zona, y recibe el
-siguiente número disponible junto con un color no usado de la paleta
-sugerida original (o un gris neutro si no queda ninguno libre, marcado para
-asignación manual — ver `docs/FUNCTIONAL_SPEC.md`, paso 4).
+De las dos piezas resultantes, la pieza de **mayor área** conserva el
+`zone_id` original. Ambas piezas conservan el mismo `paint_number` de la zona
+original, porque dividir geometría no cambia por sí solo la cantidad de
+números/colores elegida por el usuario. La pieza de menor área recibe un
+`zone_id` nuevo.
 
 **Response**: mismo shape que `/segment`.
 

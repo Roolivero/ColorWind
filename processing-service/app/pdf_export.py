@@ -56,6 +56,10 @@ def _zone_polygon(zone: dict[str, Any]) -> Polygon:
     return max(parts, key=lambda item: item.area)
 
 
+def _paint_number(zone: dict[str, Any]) -> str:
+    return str(zone.get("paint_number") or zone["id"])
+
+
 def _label_point(polygon: Polygon) -> Point:
     centroid = polygon.centroid
     if polygon.covers(centroid):
@@ -102,18 +106,21 @@ def numbered_svg(width: int, height: int, zones: list[dict[str, Any]]) -> str:
     elements: list[str] = []
     for zone in zones:
         zone_id = str(zone["id"])
+        paint_number = _paint_number(zone)
         elements.append(
             f'<path id="zone-{html.escape(zone_id)}" data-zone-id="{html.escape(zone_id)}" '
+            f'data-paint-number="{html.escape(paint_number)}" '
             f'd="{html.escape(_polygon_path(zone["polygon"]))}" fill="none" '
             'stroke="#000000" stroke-width="2" vector-effect="non-scaling-stroke"/>'
         )
     for zone in zones:
         zone_id = str(zone["id"])
+        paint_number = _paint_number(zone)
         placement = placements[zone_id]
         elements.append(
             f'<text x="{placement.x:.2f}" y="{placement.y:.2f}" text-anchor="middle" '
             f'dominant-baseline="central" font-size="{placement.font_size_image:.2f}" '
-            f'font-weight="700" fill="#000000">{html.escape(zone_id)}</text>'
+            f'font-weight="700" fill="#000000">{html.escape(paint_number)}</text>'
         )
     body = "\n  ".join(elements)
     return (
@@ -142,8 +149,10 @@ def _reportlab_color(value: str) -> colors.Color:
     return colors.HexColor(_hex_color(value))
 
 
-def _sorted_zone_ids(zones: list[dict[str, Any]]) -> list[str]:
-    return [str(zone["id"]) for zone in sorted(zones, key=lambda item: int(item["id"]))]
+def _sorted_palette_numbers(zones: list[dict[str, Any]], palette: dict[str, str]) -> list[str]:
+    numbers = set(str(number) for number in palette)
+    numbers.update(_paint_number(zone) for zone in zones)
+    return sorted(numbers, key=lambda value: int(value) if value.isdigit() else value)
 
 
 def _draw_drawing_page(
@@ -183,6 +192,7 @@ def _draw_drawing_page(
     pdf.setFillColor(colors.black)
     for zone in zones:
         zone_id = str(zone["id"])
+        paint_number = _paint_number(zone)
         placement = placements[zone_id]
         x = origin_x + placement.x * scale
         y = origin_y + (image_height - placement.y) * scale
@@ -190,13 +200,13 @@ def _draw_drawing_page(
         max_width = max(4.0, float(bbox[2]) * scale * 0.85)
         max_height = max(4.0, float(bbox[3]) * scale * 0.85)
         font_size = min(placement.font_size_image * scale, 18.0, max_height)
-        text_width = pdf.stringWidth(zone_id, "Helvetica-Bold", font_size)
+        text_width = pdf.stringWidth(paint_number, "Helvetica-Bold", font_size)
         if text_width > max_width:
             font_size = max(3.5, font_size * (max_width / text_width))
         else:
             font_size = max(3.5, font_size)
         pdf.setFont("Helvetica-Bold", font_size)
-        pdf.drawCentredString(x, y - font_size * 0.32, zone_id)
+        pdf.drawCentredString(x, y - font_size * 0.32, paint_number)
 
 
 def _draw_legend_page(
@@ -211,22 +221,22 @@ def _draw_legend_page(
     pdf.setFont("Helvetica-Bold", 18)
     pdf.drawString(margin, page_height - margin, "Leyenda de colores")
 
-    zone_ids = _sorted_zone_ids(zones)
+    palette_numbers = _sorted_palette_numbers(zones, palette)
     row_height = 24.0
     header_gap = 34.0
     usable_height = page_height - margin * 2 - header_gap
     rows_per_column = max(1, int(usable_height // row_height))
-    columns = max(1, math.ceil(len(zone_ids) / rows_per_column))
+    columns = max(1, math.ceil(len(palette_numbers) / rows_per_column))
     column_width = (page_width - margin * 2) / columns
     swatch_size = 14.0
 
     pdf.setFont("Helvetica", 10)
-    for index, zone_id in enumerate(zone_ids):
+    for index, paint_number in enumerate(palette_numbers):
         column = index // rows_per_column
         row = index % rows_per_column
         x = margin + column * column_width
         y = page_height - margin - header_gap - row * row_height
-        color_hex = _hex_color(palette.get(zone_id, "#B8B8B8"))
+        color_hex = _hex_color(palette.get(paint_number, "#B8B8B8"))
 
         pdf.setFillColor(_reportlab_color(color_hex))
         pdf.rect(x, y - swatch_size + 3, swatch_size, swatch_size, fill=1, stroke=0)
@@ -234,7 +244,7 @@ def _draw_legend_page(
         pdf.rect(x, y - swatch_size + 3, swatch_size, swatch_size, fill=0, stroke=1)
         pdf.setFillColor(colors.black)
         pdf.setFont("Helvetica-Bold", 10)
-        pdf.drawString(x + swatch_size + 8, y - 8, zone_id)
+        pdf.drawString(x + swatch_size + 8, y - 8, paint_number)
         pdf.setFont("Helvetica", 10)
         pdf.drawString(x + swatch_size + 36, y - 8, color_hex)
 

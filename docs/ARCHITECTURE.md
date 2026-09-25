@@ -46,8 +46,12 @@ cada parte se deployee por separado más adelante.
 
 ### Responsabilidades
 
-- Recibir imagen + parámetros (cantidad de colores/zonas, área mínima) →
-  devolver zonas vectorizadas (SVG/GeoJSON) + paleta de colores sugerida.
+- Recibir imagen + parámetros:
+  - `num_colors`: cantidad exacta de números/colores de pintura.
+  - `detail_level`: nivel cualitativo de detalle geométrico (bajo/medio/alto).
+- Devolver zonas vectorizadas (SVG/GeoJSON) + paleta de colores sugerida.
+  Cada zona tiene un `zone_id` geométrico y un `paint_number` visible; varios
+  `zone_id` pueden compartir el mismo `paint_number`.
 - Recibir operaciones de edición de zonas (fusionar A+B, dividir A por una
   línea) → recalcular geometría y renumerar.
 - Generar el PDF final a partir del estado actual (zonas + paleta).
@@ -84,8 +88,10 @@ projects
   id            TEXT PRIMARY KEY (uuid)
   name          TEXT
   mode          TEXT        -- "color" | "bw"
-  num_zones     INTEGER
-  min_zone_area_px INTEGER
+  num_colors    INTEGER     -- cantidad de numeros/colores de pintura
+  detail_level  REAL        -- 0 bajo, 0.5 medio, 1 alto
+  num_zones     INTEGER     -- snapshot informativo de zonas geometricas
+  min_zone_area_px INTEGER  -- legado; no se muestra en la UI nueva
   zones_geojson TEXT        -- último estado de zonas, snapshot en JSON
   palette_colors TEXT       -- paleta activa del proyecto, JSON {numero: hex}
   created_at    DATETIME
@@ -94,15 +100,16 @@ projects
 palettes
   id            TEXT PRIMARY KEY (uuid)
   name          TEXT
-  num_zones     INTEGER     -- cantidad de zonas para la que fue creada
+  num_colors    INTEGER     -- cantidad de numeros/colores para la que fue creada
+  num_zones     INTEGER     -- legado; mantener por compatibilidad local
   colors_json   TEXT        -- {numero: hex}
   created_at    DATETIME
 ```
 
-Al aplicar una paleta guardada a una imagen nueva: si su `num_zones`
-coincide con el de la imagen actual, se aplica directo; si no coincide, se
-puede ofrecer igual pero marcando que faltan/sobran colores respecto a las
-zonas reales de esa imagen.
+Al aplicar una paleta guardada a una imagen nueva: si su `num_colors`
+coincide con el proyecto actual, se aplica directo; si no coincide, se puede
+ofrecer igual pero marcando que faltan/sobran colores respecto a los números
+de pintura actuales.
 
 - No se modela `users` todavía: mientras sea de uso personal, todo es
   single-tenant (sin login). Si más adelante se abre a otros usuarios, se

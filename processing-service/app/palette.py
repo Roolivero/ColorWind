@@ -59,31 +59,31 @@ def dominant_colors(image_bgr: np.ndarray, count: int) -> list[str]:
     return colors or _fallback_seed_colors(image_bgr, target_count)
 
 
-def _palette_from_shifts(base_colors: list[str], zone_count: int, shifts: tuple[float, ...], sat_mul: float, val_mul: float) -> dict[str, str]:
-    if zone_count <= 0:
+def _palette_from_shifts(base_colors: list[str], color_count: int, shifts: tuple[float, ...], sat_mul: float, val_mul: float) -> dict[str, str]:
+    if color_count <= 0:
         return {}
 
     colors: dict[str, str] = {}
-    for index in range(zone_count):
+    for index in range(color_count):
         hue, saturation, value = _hex_to_hsv(base_colors[index % len(base_colors)])
         shift = shifts[index % len(shifts)]
         colors[str(index + 1)] = _hsv_to_hex(hue + shift, saturation * sat_mul, value * val_mul)
     return colors
 
 
-def suggested_palettes(image_bgr: np.ndarray, zone_count: int) -> list[dict[str, Any]]:
-    base = dominant_colors(image_bgr, max(zone_count, 3))
+def suggested_palettes(image_bgr: np.ndarray, color_count: int) -> list[dict[str, Any]]:
+    base = dominant_colors(image_bgr, max(color_count, 3))
     return [
         {
             "name": "Análoga",
-            "colors": _palette_from_shifts(base, zone_count, (-1 / 24, 0.0, 1 / 24), 0.9, 1.05),
+            "colors": _palette_from_shifts(base, color_count, (-1 / 24, 0.0, 1 / 24), 0.9, 1.05),
         },
         {
             "name": "Complementaria",
-            "colors": _palette_from_shifts(base, zone_count, (0.0, 0.5), 1.0, 1.0),
+            "colors": _palette_from_shifts(base, color_count, (0.0, 0.5), 1.0, 1.0),
         },
         {
             "name": "Triádica",
-            "colors": _palette_from_shifts(base, zone_count, (0.0, 1 / 3, 2 / 3), 0.95, 1.0),
+            "colors": _palette_from_shifts(base, color_count, (0.0, 1 / 3, 2 / 3), 0.95, 1.0),
         },
     ]

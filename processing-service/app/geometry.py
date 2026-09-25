@@ -4,7 +4,7 @@ import math
 from typing import Any
 
 from shapely.geometry import GeometryCollection, LineString, MultiPolygon, Polygon
-from shapely.ops import split, unary_union
+from shapely.ops import snap, split, unary_union
 from shapely.validation import make_valid
 
 
@@ -18,6 +18,10 @@ class GeometryError(ValueError):
 
 def _zone_id(zone: dict[str, Any]) -> str:
     return str(zone["id"])
+
+
+def _paint_number(zone: dict[str, Any]) -> str:
+    return str(zone.get("paint_number") or zone["id"])
 
 
 def _polygon_parts(geometry: Any) -> list[Polygon]:
@@ -79,6 +83,11 @@ def _zone_from_polygon(
     }
     if source_zone and source_zone.get("mask_index") is not None:
         next_zone["mask_index"] = source_zone["mask_index"]
+    for metadata_key in ("source", "slic_parent_id"):
+        if source_zone and source_zone.get(metadata_key) is not None:
+            next_zone[metadata_key] = source_zone[metadata_key]
+    if source_zone and source_zone.get("paint_number") is not None:
+        next_zone["paint_number"] = str(source_zone["paint_number"])
     if requires_manual_color:
         next_zone["requires_manual_color"] = True
     elif source_zone and source_zone.get("requires_manual_color"):
@@ -91,16 +100,13 @@ def _renumber(
     palette_colors: dict[str, str],
 ) -> tuple[list[dict[str, Any]], dict[str, str]]:
     next_zones: list[dict[str, Any]] = []
-    next_palette: dict[str, str] = {}
 
     for index, zone in enumerate(zones, start=1):
-        old_id = _zone_id(zone)
         next_zone = dict(zone)
         next_zone["id"] = index
         next_zones.append(next_zone)
-        next_palette[str(index)] = palette_colors.get(old_id, NEUTRAL_GRAY)
 
-    return next_zones, next_palette
+    return next_zones, palette_colors
 
 
 def _by_zone_id(zones: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
@@ -118,10 +124,12 @@ def _with_palette_defaults(
 ) -> dict[str, str]:
     current = _normalize_palette(palette_colors)
     fallback = _normalize_palette(fallback_colors)
-    return {
-        _zone_id(zone): current.get(_zone_id(zone), fallback.get(_zone_id(zone), NEUTRAL_GRAY))
-        for zone in zones
-    }
+    keys = set(current) | set(fallback) | {_paint_number(zone) for zone in zones}
+    return {key: current.get(key, fallback.get(key, NEUTRAL_GRAY)) for key in _sorted_numeric(keys)}
+
+
+def _sorted_numeric(values: set[str] | list[str]) -> list[str]:
+    return sorted(values, key=lambda value: int(value) if str(value).isdigit() else str(value))
 
 
 def should_confirm_merge(zones: list[dict[str, Any]], zone_ids: list[str]) -> bool:
@@ -136,6 +144,8 @@ def should_confirm_merge(zones: list[dict[str, Any]], zone_ids: list[str]) -> bo
         unary_union([first, second]),
         error="Las zonas elegidas no forman una region continua. Elegi dos zonas vecinas.",
     )
+    if _paint_number(zone_map[str(zone_ids[0])]) == _paint_number(zone_map[str(zone_ids[1])]):
+        return False
     larger = max(first.area, second.area)
     if larger <= 0:
         raise GeometryError("No se puede fusionar una zona sin area.")
@@ -149,6 +159,7 @@ def merge_zones(
     palette_colors: dict[str, str] | None,
     fallback_colors: dict[str, str],
     keep_zone_id: str | None,
+    snap_tolerance: float = 0.0,
 ) -> tuple[list[dict[str, Any]], dict[str, str]]:
     if len(zone_ids) != 2 or len({str(zone_id) for zone_id in zone_ids}) != 2:
         raise GeometryError("Se deben fusionar exactamente dos zonas distintas.")
@@ -162,6 +173,9 @@ def merge_zones(
     second_zone = zone_map[requested_ids[1]]
     first_polygon = _zone_to_polygon(first_zone)
     second_polygon = _zone_to_polygon(second_zone)
+    if snap_tolerance > 0:
+        second_polygon = snap(second_polygon, first_polygon, snap_tolerance)
+        first_polygon = snap(first_polygon, second_polygon, snap_tolerance)
     merged_polygon = _as_single_polygon(
         unary_union([first_polygon, second_polygon]),
         error="Las zonas elegidas no forman una region continua. Elegi dos zonas vecinas.",
@@ -170,7 +184,8 @@ def merge_zones(
     larger_zone = first_zone if first_polygon.area >= second_polygon.area else second_zone
     larger_area = max(first_polygon.area, second_polygon.area)
     area_difference = abs(first_polygon.area - second_polygon.area) / larger_area if larger_area else 0
-    if area_difference >= AREA_CONFIRMATION_THRESHOLD:
+    same_paint_number = _paint_number(first_zone) == _paint_number(second_zone)
+    if area_difference >= AREA_CONFIRMATION_THRESHOLD or same_paint_number:
         keep_id = _zone_id(larger_zone)
     elif keep_zone_id and str(keep_zone_id) in requested_ids:
         keep_id = str(keep_zone_id)
@@ -198,10 +213,6 @@ def merge_zones(
             inserted = True
 
     next_palette = dict(current_palette)
-    next_palette[keep_id] = current_palette.get(keep_id, NEUTRAL_GRAY)
-    for zone_id in requested_ids:
-        if zone_id != keep_id:
-            next_palette.pop(zone_id, None)
 
     return _renumber(next_zones, next_palette)
 
@@ -227,18 +238,6 @@ def _extend_line(points: list[list[float]], bounds: tuple[float, float, float, f
     return extended
 
 
-def _next_unused_color(
-    original_palette: dict[str, str],
-    current_palette: dict[str, str],
-) -> tuple[str, bool]:
-    used = {color.upper() for color in current_palette.values()}
-    for zone_id in sorted(original_palette, key=lambda value: int(value) if value.isdigit() else value):
-        color = original_palette[zone_id]
-        if color.upper() not in used:
-            return color, False
-    return NEUTRAL_GRAY, True
-
-
 def split_zone(
     zones: list[dict[str, Any]],
     zone_id: str,
@@ -246,7 +245,6 @@ def split_zone(
     *,
     palette_colors: dict[str, str] | None,
     fallback_colors: dict[str, str],
-    original_palette: dict[str, str],
 ) -> tuple[list[dict[str, Any]], dict[str, str]]:
     current_id = str(zone_id)
     zone_map = _by_zone_id(zones)
@@ -267,7 +265,6 @@ def split_zone(
     larger_piece, smaller_piece = pieces
     current_palette = _with_palette_defaults(zones, palette_colors, fallback_colors)
     new_id = str(max(int(_zone_id(item)) for item in zones if _zone_id(item).isdigit()) + 1)
-    new_color, requires_manual_color = _next_unused_color(original_palette, current_palette)
 
     original_zone = _zone_from_polygon(
         larger_piece,
@@ -278,14 +275,13 @@ def split_zone(
     new_zone = _zone_from_polygon(
         smaller_piece,
         new_id,
-        requires_manual_color=requires_manual_color,
+        source_zone=zone,
+        requires_manual_color=bool(zone.get("requires_manual_color")),
     )
 
     next_zones = [original_zone if _zone_id(item) == current_id else item for item in zones]
     next_zones.append(new_zone)
 
     next_palette = dict(current_palette)
-    next_palette[current_id] = current_palette.get(current_id, NEUTRAL_GRAY)
-    next_palette[new_id] = new_color
 
     return _renumber(next_zones, next_palette)

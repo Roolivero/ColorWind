@@ -15,9 +15,12 @@
 
 ### 2. Configuración inicial (antes de procesar)
 
-- Slider "Cantidad de colores/zonas" (rango sugerido: 5–30).
-- Slider "Tamaño mínimo de zona" (en píxeles o % del área total de la
-  imagen).
+- Slider "Cantidad de colores/números" (rango sugerido: 5–30). Esta cantidad
+  es exacta: son los números que aparecen en el dibujo y las entradas de la
+  paleta, siempre que existan suficientes zonas geométricas para repartirlos.
+- Slider "Nivel de detalle" (bajo/medio/alto, con puntos intermedios). Este
+  control afecta cuántas zonas geométricas intenta conservar/generar el
+  algoritmo, pero no promete una cantidad exacta de zonas.
 - Botón "Generar preview".
 
 ### 3. Preview y ajuste
@@ -31,17 +34,21 @@
 
 - Herramienta seleccionable con dos modos:
   - **Fusionar**: click en una zona + click en una zona vecina → se unen en
-    una sola, quedándose por defecto con el número/color de la zona más
-    grande (mostrar confirmación si la diferencia de tamaño es chica).
+    una sola. Si las zonas tienen distinto número/color, se conserva por
+    defecto el de la zona más grande (mostrar confirmación si la diferencia
+    de tamaño es chica). Si ambas zonas ya comparten número/color, no hace
+    falta confirmar.
   - **Dividir**: el usuario traza una línea dentro de una zona → se genera
-    una nueva zona con un número nuevo.
+    una nueva zona geométrica. Ambas piezas conservan el mismo número/color
+    de pintura de la zona original.
 - Después de cada fusión/división: renumerar automáticamente todas las
-  zonas para no dejar huecos en la numeración, y reflejar el cambio en el
-  editor de paletas (paso 5).
+  zonas geométricas para no dejar huecos en `zone_id`, sin cambiar la
+  cantidad de números/colores elegida por el usuario.
 
 ### 5. Editor de paleta
 
-- Lista de números, cada uno con su color asignado (swatch).
+- Lista de números de pintura, cada uno con su color asignado (swatch). Un
+  mismo número puede aparecer en varias zonas geométricas.
 - El usuario puede:
   - Elegir entre 2–3 paletas sugeridas automáticas, generadas a partir de
     los colores dominantes reales de la imagen (relaciones de color:
@@ -67,6 +74,7 @@
 - El resultado final (para colorear) siempre es en blanco y negro, sin
   importar el modo de entrada.
 - La numeración nunca debe tener huecos (ej. no puede faltar el número 4 si
-  hay un 3 y un 5).
+  hay un 3 y un 5). Esto aplica a los números/colores elegidos por el
+  usuario; las zonas geométricas tienen sus propios ids internos.
 - Toda edición manual de zonas debe ser reversible (undo) al menos un paso
   atrás.

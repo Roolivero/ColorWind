@@ -35,6 +35,7 @@ type ZoneFeature = {
   id?: string;
   properties?: {
     zone_id?: string;
+    paint_number?: string;
     area_px?: number;
     bbox?: number[];
     requires_manual_color?: boolean;
@@ -51,6 +52,9 @@ type ZonesGeoJson = {
     width?: number;
     height?: number;
     mode?: Mode;
+    zone_count?: number;
+    num_colors?: number;
+    detail_level?: number;
   };
   features: ZoneFeature[];
 };
@@ -70,7 +74,8 @@ type SegmentResponse = {
 type SavedPalette = {
   id: string;
   name: string;
-  num_zones: number;
+  num_colors: number;
+  num_zones?: number;
   colors: ColorMap;
   created_at: string;
 };
@@ -79,8 +84,10 @@ type CurrentProject = {
   id: string;
   name: string | null;
   mode: Mode;
-  num_zones: number;
-  min_zone_area_px: number;
+  num_colors: number;
+  detail_level: number;
+  num_zones?: number;
+  min_zone_area_px?: number;
   zones_geojson: ZonesGeoJson;
   palette_colors: ColorMap;
 };
@@ -101,12 +108,8 @@ type HistoryEntry = {
   activePalette: ColorMap;
   activePaletteName: string;
   previewView: PreviewView;
-};
-
-const minZoneAreaOptions = {
-  min: 100,
-  max: 3000,
-  step: 50,
+  numColors: number;
+  detailLevel: number;
 };
 
 const fallbackColors = [
@@ -136,15 +139,48 @@ function zoneId(feature: ZoneFeature, index: number) {
   return feature.properties?.zone_id ?? feature.id ?? String(index + 1);
 }
 
-function zoneIds(geojson: ZonesGeoJson) {
-  return geojson.features.map((feature, index) => zoneId(feature, index));
+function paintNumber(feature: ZoneFeature, index: number) {
+  return feature.properties?.paint_number ?? zoneId(feature, index);
 }
 
-function completePalette(zoneIdList: string[], colors: ColorMap, fallback: ColorMap = {}) {
-  return zoneIdList.reduce<ColorMap>((nextColors, id, index) => {
+function numberKeys(count: number) {
+  return Array.from({ length: Math.max(0, count) }, (_, index) => String(index + 1));
+}
+
+function sortedNumericIds(ids: string[]) {
+  return [...new Set(ids)].sort((a, b) => {
+    const left = Number(a);
+    const right = Number(b);
+    if (Number.isFinite(left) && Number.isFinite(right)) {
+      return left - right;
+    }
+    return a.localeCompare(b);
+  });
+}
+
+function colorIdsForResult(geojson: ZonesGeoJson, numColors: number, colors: ColorMap = {}) {
+  return sortedNumericIds([
+    ...numberKeys(numColors),
+    ...geojson.features.map((feature, index) => paintNumber(feature, index)),
+    ...Object.keys(colors),
+  ]);
+}
+
+function completePalette(colorIds: string[], colors: ColorMap, fallback: ColorMap = {}) {
+  return colorIds.reduce<ColorMap>((nextColors, id, index) => {
     nextColors[id] = colors[id] ?? fallback[id] ?? fallbackColors[index % fallbackColors.length];
     return nextColors;
   }, {});
+}
+
+function detailName(level: number) {
+  if (level < 0.34) {
+    return "Bajo";
+  }
+  if (level < 0.67) {
+    return "Medio";
+  }
+  return "Alto";
 }
 
 function polygonPath(points: number[][]) {
@@ -208,14 +244,14 @@ function geojsonToSvg(geojson: ZonesGeoJson) {
   return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${width} ${height}" width="${width}" height="${height}">${paths}</svg>`;
 }
 
-function paletteMismatchMessage(paletteZones: number, currentZones: number) {
-  if (!currentZones || paletteZones === currentZones) {
+function paletteMismatchMessage(paletteColors: number, currentColors: number) {
+  if (!currentColors || paletteColors === currentColors) {
     return "";
   }
-  if (paletteZones < currentZones) {
-    return `La paleta tiene ${paletteZones} colores y esta imagen tiene ${currentZones} zonas. Se aplica igual; las zonas sin color conservan el color actual.`;
+  if (paletteColors < currentColors) {
+    return `La paleta tiene ${paletteColors} colores y este proyecto usa ${currentColors} numeros. Se aplica igual; los numeros sin color conservan el color actual.`;
   }
-  return `La paleta tiene ${paletteZones} colores y esta imagen tiene ${currentZones} zonas. Se aplica igual; los colores sobrantes no se usan.`;
+  return `La paleta tiene ${paletteColors} colores y este proyecto usa ${currentColors} numeros. Se aplica igual; los colores sobrantes no se usan.`;
 }
 
 function cloneResult(result: SegmentResponse): SegmentResponse {
@@ -227,14 +263,24 @@ function cloneResult(result: SegmentResponse): SegmentResponse {
   };
 }
 
-function manualColorZoneIds(geojson: ZonesGeoJson) {
-  return geojson.features
-    .map((feature, index) => ({
-      id: zoneId(feature, index),
-      needsColor: Boolean(feature.properties?.requires_manual_color),
-    }))
-    .filter((zone) => zone.needsColor)
-    .map((zone) => zone.id);
+function manualColorNumbers(geojson: ZonesGeoJson) {
+  return sortedNumericIds(
+    geojson.features
+      .map((feature, index) => ({
+        id: paintNumber(feature, index),
+        needsColor: Boolean(feature.properties?.requires_manual_color),
+      }))
+      .filter((zone) => zone.needsColor)
+      .map((zone) => zone.id),
+  );
+}
+
+function paintNumberForZoneId(geojson: ZonesGeoJson, id: string) {
+  const featureIndex = geojson.features.findIndex((feature, index) => zoneId(feature, index) === id);
+  if (featureIndex < 0) {
+    return id;
+  }
+  return paintNumber(geojson.features[featureIndex], featureIndex);
 }
 
 function isMergeConfirmation(data: unknown): data is MergeConfirmation {
@@ -298,13 +344,14 @@ function ZonesPreview({
     >
       {geojson.features.map((feature, index) => {
         const id = zoneId(feature, index);
+        const colorNumber = paintNumber(feature, index);
         const ring = feature.geometry.coordinates[0] ?? [];
         const isSelected = id === selectedMergeZone || id === splitDraft?.zoneId;
         return (
           <path
             key={`zone-${id}`}
             d={polygonPath(ring)}
-            fill={view === "color" ? colors[id] ?? "#ffffff" : "transparent"}
+            fill={view === "color" ? colors[colorNumber] ?? "#ffffff" : "transparent"}
             stroke={isSelected ? "#d86f45" : "#111111"}
             strokeWidth={isSelected ? 4 : 2}
             vectorEffect="non-scaling-stroke"
@@ -333,6 +380,7 @@ function ZonesPreview({
       ) : null}
       {geojson.features.map((feature, index) => {
         const id = zoneId(feature, index);
+        const colorNumber = paintNumber(feature, index);
         const ring = feature.geometry.coordinates[0] ?? [];
         const centroid = polygonCentroid(ring);
         return (
@@ -350,7 +398,7 @@ function ZonesPreview({
             strokeWidth={4}
             pointerEvents="none"
           >
-            {id}
+            {colorNumber}
           </text>
         );
       })}
@@ -365,8 +413,8 @@ export default function Home() {
   const [imageBase64, setImageBase64] = useState("");
   const [referenceUrl, setReferenceUrl] = useState("");
   const [mode, setMode] = useState<Mode>("color");
-  const [numZones, setNumZones] = useState(12);
-  const [minZoneAreaPx, setMinZoneAreaPx] = useState(500);
+  const [numColors, setNumColors] = useState(12);
+  const [detailLevel, setDetailLevel] = useState(0.5);
   const [result, setResult] = useState<SegmentResponse | null>(null);
   const [previewView, setPreviewView] = useState<PreviewView>("lines");
   const [activePalette, setActivePalette] = useState<ColorMap>({});
@@ -394,9 +442,9 @@ export default function Home() {
   const [exportStatus, setExportStatus] = useState("");
 
   const zoneCount = result?.zones_geojson.features.length ?? 0;
-  const currentZoneIds = useMemo(
-    () => (result ? zoneIds(result.zones_geojson) : []),
-    [result],
+  const currentColorIds = useMemo(
+    () => (result ? colorIdsForResult(result.zones_geojson, numColors) : numberKeys(numColors)),
+    [result, numColors],
   );
 
   useEffect(() => {
@@ -423,8 +471,8 @@ export default function Home() {
             };
             setResult(restored);
             setMode(data.project.mode);
-            setNumZones(data.project.num_zones);
-            setMinZoneAreaPx(data.project.min_zone_area_px);
+            setNumColors(data.project.num_colors ?? (Object.keys(data.project.palette_colors).length || 12));
+            setDetailLevel(data.project.detail_level ?? 0.5);
             setActivePalette(data.project.palette_colors);
             setActivePaletteName("Proyecto guardado");
             setPreviewView("color");
@@ -457,9 +505,14 @@ export default function Home() {
         clearTimeout(persistTimer.current);
       }
     };
-  }, [result, activePalette, mode, numZones, minZoneAreaPx]);
+  }, [result, activePalette, mode, numColors, detailLevel]);
 
-  async function persistProject(nextResult: SegmentResponse, colors: ColorMap) {
+  async function persistProject(
+    nextResult: SegmentResponse,
+    colors: ColorMap,
+    projectNumColors = numColors,
+    projectDetailLevel = detailLevel,
+  ) {
     try {
       const response = await fetch("/api/projects/current", {
         method: "POST",
@@ -468,8 +521,9 @@ export default function Home() {
           id: nextResult.project_id,
           name: "Proyecto actual",
           mode,
-          num_zones: nextResult.zones_geojson.features.length,
-          min_zone_area_px: minZoneAreaPx,
+          num_colors: projectNumColors,
+          detail_level: projectDetailLevel,
+          zone_count: nextResult.zones_geojson.features.length,
           zones_geojson: nextResult.zones_geojson,
           palette_colors: colors,
         }),
@@ -544,8 +598,8 @@ export default function Home() {
         body: JSON.stringify({
           image_base64: imageBase64,
           mode,
-          num_zones: numZones,
-          min_zone_area_px: minZoneAreaPx,
+          num_colors: numColors,
+          detail_level: detailLevel,
         }),
       });
 
@@ -559,9 +613,11 @@ export default function Home() {
       }
 
       const nextResult = data as SegmentResponse;
-      const ids = zoneIds(nextResult.zones_geojson);
+      const responseNumColors = nextResult.zones_geojson.properties?.num_colors ?? numColors;
+      const ids = colorIdsForResult(nextResult.zones_geojson, responseNumColors);
       const firstPalette = nextResult.suggested_palettes[0];
       const nextPalette = completePalette(ids, firstPalette?.colors ?? {});
+      setNumColors(responseNumColors);
       setResult(nextResult);
       setActivePalette(nextPalette);
       setActivePaletteName(firstPalette?.name ?? "Paleta actual");
@@ -590,7 +646,7 @@ export default function Home() {
     if (!result) {
       return;
     }
-    setActivePalette(completePalette(currentZoneIds, palette.colors, activePalette));
+    setActivePalette(completePalette(currentColorIds, palette.colors, activePalette));
     setActivePaletteName(palette.name);
     setPaletteWarning("");
     setSelectedSavedPalette("");
@@ -620,7 +676,7 @@ export default function Home() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           name: paletteName.trim(),
-          num_zones: zoneCount,
+          num_colors: currentColorIds.length,
           colors: activePalette,
         }),
       });
@@ -647,9 +703,10 @@ export default function Home() {
       return;
     }
 
-    setActivePalette(completePalette(currentZoneIds, palette.colors, activePalette));
+    const paletteColorCount = palette.num_colors ?? palette.num_zones ?? Object.keys(palette.colors).length;
+    setActivePalette(completePalette(currentColorIds, palette.colors, activePalette));
     setActivePaletteName(palette.name);
-    setPaletteWarning(paletteMismatchMessage(palette.num_zones, zoneCount));
+    setPaletteWarning(paletteMismatchMessage(paletteColorCount, currentColorIds.length));
     setPreviewView("color");
   }
 
@@ -662,14 +719,16 @@ export default function Home() {
       activePalette: { ...activePalette },
       activePaletteName,
       previewView,
+      numColors,
+      detailLevel,
     };
   }
 
   function applyEditedResult(nextResult: SegmentResponse, snapshot: HistoryEntry | null) {
-    const ids = zoneIds(nextResult.zones_geojson);
+    const ids = colorIdsForResult(nextResult.zones_geojson, numColors, activePalette);
     const responsePalette = nextResult.suggested_palettes[0];
     const nextPalette = completePalette(ids, responsePalette?.colors ?? {}, activePalette);
-    const manualZones = manualColorZoneIds(nextResult.zones_geojson);
+    const manualNumbers = manualColorNumbers(nextResult.zones_geojson);
 
     if (snapshot) {
       setHistory((current) => [...current, snapshot]);
@@ -679,13 +738,12 @@ export default function Home() {
     setActivePaletteName(responsePalette?.name ?? "Paleta actualizada");
     setSelectedSavedPalette("");
     setPreviewView("color");
-    setNumZones(ids.length);
     setSelectedMergeZone("");
     setSplitDraft(null);
     setMergeConfirmation(null);
     setPaletteWarning(
-      manualZones.length
-        ? `La zona ${manualZones.join(", ")} quedo con gris neutro y requiere asignacion manual.`
+      manualNumbers.length
+        ? `El numero ${manualNumbers.join(", ")} quedo con gris neutro y requiere asignacion manual.`
         : "",
     );
     void persistProject(nextResult, nextPalette);
@@ -702,12 +760,13 @@ export default function Home() {
     setActivePalette(previous.activePalette);
     setActivePaletteName(previous.activePaletteName);
     setPreviewView(previous.previewView);
-    setNumZones(previous.result.zones_geojson.features.length);
+    setNumColors(previous.numColors);
+    setDetailLevel(previous.detailLevel);
     setSelectedMergeZone("");
     setSplitDraft(null);
     setMergeConfirmation(null);
     setPaletteWarning("");
-    void persistProject(previous.result, previous.activePalette);
+    void persistProject(previous.result, previous.activePalette, previous.numColors, previous.detailLevel);
     setEditStatus("Ultima edicion deshecha.");
   }
 
@@ -970,33 +1029,38 @@ export default function Home() {
               <div className="mt-5 space-y-5">
                 <label className="block">
                   <span className="flex items-center justify-between text-sm font-semibold">
-                    <span>Cantidad de colores/zonas</span>
-                    <span>{numZones}</span>
+                    <span>Cantidad de colores/numeros</span>
+                    <span>{numColors}</span>
                   </span>
                   <input
                     type="range"
                     min={5}
                     max={30}
-                    value={numZones}
-                    onChange={(event) => setNumZones(Number(event.target.value))}
+                    value={numColors}
+                    onChange={(event) => setNumColors(Number(event.target.value))}
                     className="mt-3 w-full accent-[var(--accent)]"
                   />
                 </label>
 
                 <label className="block">
                   <span className="flex items-center justify-between text-sm font-semibold">
-                    <span>Tamano minimo de zona</span>
-                    <span>{minZoneAreaPx}px</span>
+                    <span>Nivel de detalle</span>
+                    <span>{detailName(detailLevel)}</span>
                   </span>
                   <input
                     type="range"
-                    min={minZoneAreaOptions.min}
-                    max={minZoneAreaOptions.max}
-                    step={minZoneAreaOptions.step}
-                    value={minZoneAreaPx}
-                    onChange={(event) => setMinZoneAreaPx(Number(event.target.value))}
+                    min={0}
+                    max={100}
+                    step={1}
+                    value={Math.round(detailLevel * 100)}
+                    onChange={(event) => setDetailLevel(Number(event.target.value) / 100)}
                     className="mt-3 w-full accent-[var(--accent)]"
                   />
+                  <span className="mt-2 flex justify-between text-xs font-medium text-[#66705f]">
+                    <span>Bajo</span>
+                    <span>Medio</span>
+                    <span>Alto</span>
+                  </span>
                 </label>
               </div>
 
@@ -1030,7 +1094,7 @@ export default function Home() {
                 <h2 className="text-lg font-semibold">Preview</h2>
                 <p className="text-sm text-[#657061]">
                   {result
-                    ? `${zoneCount} zonas generadas - ${activePaletteName}`
+                    ? `${zoneCount} zonas generadas - ${currentColorIds.length} numeros - ${activePaletteName}`
                     : "El resultado segmentado aparece aca."}
                 </p>
               </div>
@@ -1257,7 +1321,7 @@ export default function Home() {
                     <option value="">Elegir paleta guardada</option>
                     {savedPalettes.map((palette) => (
                       <option key={palette.id} value={palette.id}>
-                        {palette.name} ({palette.num_zones})
+                        {palette.name} ({palette.num_colors ?? palette.num_zones} colores)
                       </option>
                     ))}
                   </select>
@@ -1272,7 +1336,7 @@ export default function Home() {
                 <section>
                   <h3 className="text-sm font-semibold">Colores</h3>
                   <div className="mt-3 max-h-[360px] space-y-2 overflow-auto pr-1">
-                    {currentZoneIds.map((id) => (
+                    {currentColorIds.map((id) => (
                       <label
                         key={id}
                         className="flex items-center gap-3 rounded-md bg-[var(--panel-muted)] px-3 py-2"
@@ -1285,7 +1349,7 @@ export default function Home() {
                           value={activePalette[id] ?? "#ffffff"}
                           onChange={(event) => updateColor(id, event.target.value)}
                           className="h-8 w-10 cursor-pointer rounded border border-[var(--line)] bg-transparent"
-                          aria-label={`Color zona ${id}`}
+                          aria-label={`Color numero ${id}`}
                         />
                         <span className="text-sm font-medium uppercase text-[#4c5548]">
                           {activePalette[id] ?? "#ffffff"}
@@ -1340,24 +1404,32 @@ export default function Home() {
               Las zonas tienen areas similares. Elegi que color queda en la zona fusionada.
             </p>
             <div className="mt-4 grid gap-2">
-              {mergeConfirmation.candidates.map((candidate) => (
-                <button
-                  key={candidate}
-                  type="button"
-                  onClick={() => void requestMerge(mergeConfirmation.candidates, candidate)}
-                  disabled={isEditingZones}
-                  className="flex items-center justify-between rounded-md border border-[var(--line)] px-3 py-2 text-sm font-semibold hover:border-[var(--accent)] disabled:cursor-not-allowed disabled:opacity-50"
-                >
-                  <span>Zona {candidate}</span>
-                  <span className="flex items-center gap-2 uppercase text-[#4c5548]">
-                    <span
-                      className="size-6 rounded border border-[var(--line)]"
-                      style={{ backgroundColor: activePalette[candidate] ?? "#ffffff" }}
-                    />
-                    {activePalette[candidate] ?? "#ffffff"}
-                  </span>
-                </button>
-              ))}
+              {mergeConfirmation.candidates.map((candidate) => {
+                const candidateNumber = result
+                  ? paintNumberForZoneId(result.zones_geojson, candidate)
+                  : candidate;
+                const candidateColor = activePalette[candidateNumber] ?? "#ffffff";
+                return (
+                  <button
+                    key={candidate}
+                    type="button"
+                    onClick={() => void requestMerge(mergeConfirmation.candidates, candidate)}
+                    disabled={isEditingZones}
+                    className="flex items-center justify-between rounded-md border border-[var(--line)] px-3 py-2 text-sm font-semibold hover:border-[var(--accent)] disabled:cursor-not-allowed disabled:opacity-50"
+                  >
+                    <span>
+                      Zona {candidate} - numero {candidateNumber}
+                    </span>
+                    <span className="flex items-center gap-2 uppercase text-[#4c5548]">
+                      <span
+                        className="size-6 rounded border border-[var(--line)]"
+                        style={{ backgroundColor: candidateColor }}
+                      />
+                      {candidateColor}
+                    </span>
+                  </button>
+                );
+              })}
             </div>
             <button
               type="button"
