@@ -1,20 +1,29 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+import math
 from pathlib import Path
 import time
 from typing import Any
 
 import cv2
 import numpy as np
-from shapely.geometry import GeometryCollection, MultiPolygon, Polygon
+from shapely.geometry import GeometryCollection, LineString, MultiPolygon, Polygon
+from shapely.ops import split
 from shapely.validation import make_valid
 from skimage.segmentation import slic
 
 from app.geometry import GeometryError, merge_zones
 
 
-GRAPH_ADJACENCY_TOLERANCE_PX = 2.0
+# Paintable regions in line-art are separated by the black stroke itself, so
+# vectorized polygons often have a real gap of several pixels between visual
+# neighbors. Keep this tolerance wide enough to cross normal stroke thickness.
+GRAPH_ADJACENCY_TOLERANCE_PX = 10.0
+SUBDIVISION_ZONE_SOURCES = {
+    "lineart_slic_subzone",
+    "lineart_curved_subzone",
+}
 
 
 @dataclass(frozen=True)
@@ -35,9 +44,10 @@ class LineArtParams:
     slic_large_zone_multiplier_high_detail: float = 2.0
     slic_target_area_multiplier_low_detail: float = 3.4
     slic_target_area_multiplier_high_detail: float = 1.2
-    slic_compactness_low_detail: float = 24.0
-    slic_compactness_high_detail: float = 12.0
+    slic_compactness_low_detail: float = 10.0
+    slic_compactness_high_detail: float = 4.0
     slic_max_segments_per_zone: int = 64
+    subdivision_strategy: str = "curved"
     merge_small_slic_fragments: bool = True
     small_fragment_max_iterations_multiplier: int = 3
 
@@ -63,6 +73,11 @@ def derived_lineart_params(width: int, height: int, params: LineArtParams) -> di
         detail_level,
     )
     min_area_px = params.min_area_px or int(round(width * height * min_area_ratio))
+    min_area_px = max(20, min_area_px)
+    # Region detection must be more permissive than subdivision/merge sizing:
+    # otherwise detailed line-art loses legitimate closed regions and leaves
+    # unpainted holes in the preview.
+    component_min_area_px = max(30, int(round(min_area_px * 0.06)))
     close_kernel = _odd(
         round(
             _interpolate(
@@ -79,7 +94,8 @@ def derived_lineart_params(width: int, height: int, params: LineArtParams) -> di
     )
     return {
         "detail_level": detail_level,
-        "min_area_px": max(20, min_area_px),
+        "min_area_px": min_area_px,
+        "component_min_area_px": component_min_area_px,
         "close_kernel": close_kernel,
         "adaptive_block_size": _odd(params.adaptive_block_size),
         "adaptive_c": params.adaptive_c,
@@ -101,6 +117,7 @@ def derived_lineart_params(width: int, height: int, params: LineArtParams) -> di
             detail_level,
         ),
         "slic_max_segments_per_zone": params.slic_max_segments_per_zone,
+        "subdivision_strategy": params.subdivision_strategy,
         "merge_small_slic_fragments": params.merge_small_slic_fragments,
         "small_fragment_max_iterations_multiplier": params.small_fragment_max_iterations_multiplier,
     }
@@ -196,7 +213,7 @@ def _mask_from_zone(zone: dict[str, Any], shape: tuple[int, int]) -> np.ndarray:
 def _noise_feature(height: int, width: int, seed: int) -> np.ndarray:
     rng = np.random.default_rng(seed)
     noise = rng.normal(0.0, 1.0, (height, width)).astype(np.float32)
-    blur_size = _odd(max(9, round(min(height, width) / 8)))
+    blur_size = _odd(max(15, round(min(height, width) / 5)))
     noise = cv2.GaussianBlur(noise, (blur_size, blur_size), 0)
     cv2.normalize(noise, noise, 0.0, 1.0, cv2.NORM_MINMAX)
     return noise
@@ -206,10 +223,8 @@ def _slic_feature_image(image_bgr: np.ndarray, zone_id: int) -> np.ndarray:
     height, width = image_bgr.shape[:2]
     gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY).astype(np.float32) / 255.0
     noise = _noise_feature(height, width, zone_id * 7919)
-    yy, xx = np.mgrid[0:height, 0:width].astype(np.float32)
-    xx = xx / max(width - 1, 1)
-    yy = yy / max(height - 1, 1)
-    return np.dstack([gray, noise, (xx + yy) * 0.5]).astype(np.float32)
+    edge_hint = cv2.GaussianBlur(gray, (_odd(max(7, round(min(height, width) / 16))),) * 2, 0)
+    return np.dstack([gray, noise, edge_hint]).astype(np.float32)
 
 
 def _zone_from_mask(
@@ -245,6 +260,13 @@ def _zone_from_mask(
     if extra_properties:
         zone.update(extra_properties)
     return zone
+
+
+def _smooth_subzone_mask(mask: np.ndarray, zone_mask: np.ndarray) -> np.ndarray:
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    smoothed = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=1)
+    smoothed = cv2.morphologyEx(smoothed, cv2.MORPH_OPEN, kernel, iterations=1)
+    return cv2.bitwise_and(smoothed, zone_mask)
 
 
 def _subdivide_zone_with_slic(
@@ -297,11 +319,199 @@ def _subdivide_zone_with_slic(
         label_mask = ((labels == label) & mask_crop).astype(np.uint8) * 255
         full_label_mask = np.zeros(image_bgr.shape[:2], dtype=np.uint8)
         full_label_mask[y0:y1, x0:x1] = label_mask
+        full_label_mask = _smooth_subzone_mask(full_label_mask, full_mask)
         subzone = _zone_from_mask(
             full_label_mask,
             zone_id=next_zone_id + len(subzones),
             source="lineart_slic_subzone",
-            epsilon_ratio=max(0.0008, epsilon_ratio * 0.45),
+            epsilon_ratio=max(0.0014, epsilon_ratio * 0.8),
+            min_area_px=max(8, int(min_area_px * 0.15)),
+            extra_properties={"slic_parent_id": str(zone["id"])},
+        )
+        if subzone is not None:
+            subzones.append(subzone)
+
+    if len(subzones) < 2:
+        return [zone]
+    return subzones
+
+
+def _zone_from_polygon_for_lineart(
+    polygon: Polygon,
+    *,
+    zone_id: int,
+    source: str,
+    min_area_px: int,
+    extra_properties: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    geometry = make_valid(polygon)
+    parts = [part for part in _polygon_parts(geometry) if part.area >= min_area_px]
+    if not parts:
+        return None
+
+    clean = max(parts, key=lambda part: part.area)
+    if not clean.is_valid:
+        clean = clean.buffer(0)
+    if clean.is_empty or clean.area < min_area_px:
+        return None
+
+    coordinates: list[list[int]] = []
+    for x, y in clean.exterior.coords[:-1]:
+        point = [int(round(x)), int(round(y))]
+        if not coordinates or coordinates[-1] != point:
+            coordinates.append(point)
+
+    if len(coordinates) < 3:
+        return None
+
+    min_x, min_y, max_x, max_y = clean.bounds
+    zone = {
+        "id": zone_id,
+        "area_px": round(float(clean.area), 2),
+        "bbox": [
+            int(math.floor(min_x)),
+            int(math.floor(min_y)),
+            int(math.ceil(max_x - min_x)),
+            int(math.ceil(max_y - min_y)),
+        ],
+        "polygon": coordinates,
+        "source": source,
+    }
+    if extra_properties:
+        zone.update(extra_properties)
+    return zone
+
+
+def _curved_split_line(piece: Polygon, rng: np.random.Generator) -> LineString:
+    min_x, min_y, max_x, max_y = piece.bounds
+    width = max(max_x - min_x, 1.0)
+    height = max(max_y - min_y, 1.0)
+    diagonal = max(math.hypot(width, height), 1.0)
+    center = piece.representative_point()
+    angle = float(rng.uniform(0.0, math.pi))
+    direction = np.array([math.cos(angle), math.sin(angle)], dtype=np.float64)
+    normal = np.array([-direction[1], direction[0]], dtype=np.float64)
+    center_point = np.array([center.x, center.y], dtype=np.float64)
+
+    short_side = max(min(width, height), 1.0)
+    offset = float(rng.uniform(-0.12, 0.12) * short_side)
+    amplitude = float(rng.uniform(0.08, 0.22) * short_side)
+    secondary_amplitude = amplitude * float(rng.uniform(0.25, 0.55))
+    frequency = float(rng.uniform(0.75, 1.7))
+    secondary_frequency = frequency * float(rng.uniform(1.7, 2.6))
+    phase = float(rng.uniform(0.0, math.tau))
+    secondary_phase = float(rng.uniform(0.0, math.tau))
+
+    points: list[tuple[float, float]] = []
+    extent = diagonal * 0.85
+    for index in range(56):
+        unit = index / 55
+        t = -extent + (extent * 2.0 * unit)
+        wave_position = (unit - 0.5) * math.tau
+        wave = (
+            offset
+            + amplitude * math.sin(wave_position * frequency + phase)
+            + secondary_amplitude * math.sin(wave_position * secondary_frequency + secondary_phase)
+        )
+        point = center_point + direction * t + normal * wave
+        points.append((float(point[0]), float(point[1])))
+    return LineString(points)
+
+
+def _split_piece_with_curves(
+    piece: Polygon,
+    *,
+    rng: np.random.Generator,
+    min_piece_area_px: float,
+) -> list[Polygon] | None:
+    best_parts: list[Polygon] | None = None
+    best_score = -1.0
+
+    def compactness(polygon: Polygon) -> float:
+        perimeter = max(float(polygon.length), 1.0)
+        return min(1.0, (4.0 * math.pi * float(polygon.area)) / (perimeter * perimeter))
+
+    for _ in range(56):
+        line = _curved_split_line(piece, rng)
+        try:
+            split_result = split(piece, line)
+        except Exception:
+            continue
+
+        parts = [part for part in _polygon_parts(split_result) if part.area >= min_piece_area_px]
+        if len(parts) < 2:
+            continue
+
+        area_sum = sum(part.area for part in parts)
+        if area_sum < piece.area * 0.92:
+            continue
+
+        smallest = min(part.area for part in parts)
+        largest = max(part.area for part in parts)
+        balance = smallest / max(largest, 1.0)
+        compactness_values = [compactness(part) for part in parts]
+        score = (
+            balance * 0.55
+            + (sum(compactness_values) / len(compactness_values)) * 0.35
+            + min(compactness_values) * 0.25
+            + min(len(parts), 3) * 0.04
+        )
+        if score > best_score:
+            best_score = score
+            best_parts = parts
+
+    return best_parts
+
+
+def _subdivide_zone_with_curved_splits(
+    zone: dict[str, Any],
+    *,
+    next_zone_id: int,
+    target_area_px: float,
+    min_area_px: int,
+    max_segments_per_zone: int,
+) -> list[dict[str, Any]]:
+    source_polygon = _zone_polygon(zone)
+    if source_polygon is None:
+        return [zone]
+
+    area = max(float(source_polygon.area), 1.0)
+    segment_count = int(round(area / max(target_area_px, 1.0)))
+    segment_count = max(2, min(segment_count, max_segments_per_zone))
+    if segment_count < 2:
+        return [zone]
+
+    rng = np.random.default_rng(int(zone["id"]) * 104_729 + int(round(area)))
+    pieces = [source_polygon]
+    min_piece_area_px = max(12.0, float(min_area_px) * 0.22)
+    stalled_attempts = 0
+    while len(pieces) < segment_count and stalled_attempts < segment_count * 6:
+        split_index, piece = max(enumerate(pieces), key=lambda item: item[1].area)
+        if piece.area < min_piece_area_px * 2.4:
+            break
+
+        split_parts = _split_piece_with_curves(
+            piece,
+            rng=rng,
+            min_piece_area_px=min_piece_area_px,
+        )
+        if not split_parts:
+            stalled_attempts += 1
+            continue
+
+        pieces.pop(split_index)
+        pieces.extend(split_parts)
+        pieces.sort(key=lambda part: (part.bounds[1], part.bounds[0], -part.area))
+
+    if len(pieces) < 2:
+        return [zone]
+
+    subzones: list[dict[str, Any]] = []
+    for piece in pieces:
+        subzone = _zone_from_polygon_for_lineart(
+            piece,
+            zone_id=next_zone_id + len(subzones),
+            source="lineart_curved_subzone",
             min_area_px=max(8, int(min_area_px * 0.15)),
             extra_properties={"slic_parent_id": str(zone["id"])},
         )
@@ -349,16 +559,25 @@ def subdivide_large_zones(
             next_zone_id += 1
             continue
 
-        subzones = _subdivide_zone_with_slic(
-            image_bgr,
-            zone,
-            next_zone_id=next_zone_id,
-            target_area_px=target_area_px,
-            min_area_px=int(derived["min_area_px"]),
-            epsilon_ratio=float(derived["epsilon_ratio"]),
-            compactness=float(derived["slic_compactness"]),
-            max_segments_per_zone=int(derived["slic_max_segments_per_zone"]),
-        )
+        if derived.get("subdivision_strategy") == "curved":
+            subzones = _subdivide_zone_with_curved_splits(
+                zone,
+                next_zone_id=next_zone_id,
+                target_area_px=target_area_px,
+                min_area_px=int(derived["min_area_px"]),
+                max_segments_per_zone=int(derived["slic_max_segments_per_zone"]),
+            )
+        else:
+            subzones = _subdivide_zone_with_slic(
+                image_bgr,
+                zone,
+                next_zone_id=next_zone_id,
+                target_area_px=target_area_px,
+                min_area_px=int(derived["min_area_px"]),
+                epsilon_ratio=float(derived["epsilon_ratio"]),
+                compactness=float(derived["slic_compactness"]),
+                max_segments_per_zone=int(derived["slic_max_segments_per_zone"]),
+            )
         if len(subzones) > 1:
             subdivided_zones += 1
             created_zones += len(subzones)
@@ -375,6 +594,7 @@ def subdivide_large_zones(
         "slic_created_zones": created_zones,
         "slic_target_area_px": round(target_area_px, 2),
         "slic_large_zone_threshold_px": round(large_zone_threshold_px, 2),
+        "subdivision_strategy": derived.get("subdivision_strategy", "slic"),
     }
     return next_zones, metrics
 
@@ -530,6 +750,7 @@ def assign_graph_paint_numbers(
     num_colors: int,
     *,
     tolerance_px: float = GRAPH_ADJACENCY_TOLERANCE_PX,
+    label_min_area_px: float | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     if not zones:
         return zones, {
@@ -636,6 +857,14 @@ def assign_graph_paint_numbers(
     for zone in next_zones:
         zone["paint_number"] = assignments[str(zone["id"])]
 
+    graph_coloring_collisions = count_adjacency_collisions(next_zones, adjacency_graph)
+    label_metrics = suppress_small_zone_labels(
+        next_zones,
+        label_min_area_px=label_min_area_px,
+        adjacency_graph=adjacency_graph,
+    )
+    inherited_label_collisions = count_adjacency_collisions(next_zones, adjacency_graph)
+
     component_sizes = _graph_component_sizes(adjacency_graph)
     edge_count = sum(len(neighbors) for neighbors in adjacency_graph.values()) // 2
     distribution = paint_number_distribution(next_zones, color_count)
@@ -643,7 +872,8 @@ def assign_graph_paint_numbers(
         "paint_number_strategy": "lineart_graph_coloring",
         "paint_number_adjacency_tolerance_px": tolerance_px,
         "paint_number_adjacency_edges": edge_count,
-        "paint_number_collisions": count_adjacency_collisions(next_zones, adjacency_graph),
+        "paint_number_collisions": graph_coloring_collisions,
+        "paint_number_collisions_after_label_inheritance": inherited_label_collisions,
         "paint_number_distribution": distribution,
         "paint_number_unused_numbers": [
             paint_number
@@ -654,15 +884,98 @@ def assign_graph_paint_numbers(
         "paint_number_component_count": len(component_sizes),
         "paint_number_largest_component": component_sizes[0] if component_sizes else 0,
         "paint_number_seconds": round(time.perf_counter() - started, 4),
+        **label_metrics,
     }
     return next_zones, metrics
+
+
+def _is_label_too_small(zone: dict[str, Any], label_min_area_px: float) -> bool:
+    bbox = zone.get("bbox") or [0, 0, 0, 0]
+    return (
+        float(zone.get("area_px") or 0) < label_min_area_px
+        or min(float(bbox[2] or 0), float(bbox[3] or 0)) < 14
+    )
+
+
+def suppress_small_zone_labels(
+    zones: list[dict[str, Any]],
+    *,
+    label_min_area_px: float | None,
+    adjacency_graph: dict[str, set[str]] | None = None,
+) -> dict[str, Any]:
+    if not zones or label_min_area_px is None or label_min_area_px <= 0:
+        return {
+            "paint_number_label_min_area_px": 0,
+            "paint_number_suppressed_labels": 0,
+            "paint_number_inherited_labels": 0,
+            "paint_number_visible_labels": len(zones),
+        }
+
+    zone_by_id = {str(zone["id"]): zone for zone in zones}
+    adjacency_graph = adjacency_graph or build_zone_adjacency_graph(zones)
+    polygons: dict[str, Polygon] = {}
+    for zone in zones:
+        polygon = _zone_polygon(zone)
+        if polygon is not None:
+            polygons[str(zone["id"])] = polygon
+
+    labelable_ids = {
+        str(zone["id"])
+        for zone in zones
+        if not _is_label_too_small(zone, label_min_area_px)
+    }
+    suppressed_count = 0
+    inherited_count = 0
+
+    for zone in zones:
+        zone_id = str(zone["id"])
+        if zone_id in labelable_ids:
+            zone.pop("suppress_label", None)
+            continue
+
+        zone["suppress_label"] = True
+        suppressed_count += 1
+
+        candidate_ids = [
+            neighbor_id
+            for neighbor_id in adjacency_graph.get(zone_id, set())
+            if neighbor_id in labelable_ids
+        ]
+        if candidate_ids:
+            target_id = max(
+                candidate_ids,
+                key=lambda candidate_id: float(zone_by_id[candidate_id].get("area_px") or 0),
+            )
+        else:
+            polygon = polygons.get(zone_id)
+            if polygon is None or not labelable_ids:
+                continue
+            target_id = min(
+                labelable_ids,
+                key=lambda candidate_id: (
+                    polygon.distance(polygons[candidate_id]) if candidate_id in polygons else float("inf"),
+                    -float(zone_by_id[candidate_id].get("area_px") or 0),
+                ),
+            )
+
+        target_number = zone_by_id[target_id].get("paint_number")
+        if target_number is not None and zone.get("paint_number") != target_number:
+            zone["paint_number"] = str(target_number)
+            inherited_count += 1
+
+    return {
+        "paint_number_label_min_area_px": round(float(label_min_area_px), 2),
+        "paint_number_suppressed_labels": suppressed_count,
+        "paint_number_inherited_labels": inherited_count,
+        "paint_number_visible_labels": len(zones) - suppressed_count,
+    }
 
 
 def _small_slic_zone(zones: list[dict[str, Any]], min_area_px: int) -> dict[str, Any] | None:
     small_zones = [
         zone
         for zone in zones
-        if zone.get("source") == "lineart_slic_subzone"
+        if zone.get("source") in SUBDIVISION_ZONE_SOURCES
         and float(zone.get("area_px") or 0) < min_area_px
     ]
     if not small_zones:
@@ -775,7 +1088,7 @@ def merge_small_slic_fragments(
             "source": zone.get("source"),
         }
         for zone in current_zones
-        if zone.get("source") == "lineart_slic_subzone"
+        if zone.get("source") in SUBDIVISION_ZONE_SOURCES
         and float(zone.get("area_px") or 0) < min_area_px
     ]
     metrics = {
@@ -803,9 +1116,9 @@ def segment_lineart(image_bgr: np.ndarray, params: LineArtParams) -> dict[str, A
     zones = _zones_from_component_labels(
         labels,
         stats,
-        min_area_px=int(derived["min_area_px"]),
+        min_area_px=int(derived["component_min_area_px"]),
         max_area_px=float(derived["max_area_px"]),
-        epsilon_ratio=float(derived["epsilon_ratio"]),
+        epsilon_ratio=max(0.0008, float(derived["epsilon_ratio"]) * 0.35),
     )
     pre_slic_zone_count = len(zones)
     if params.enable_slic:
@@ -840,6 +1153,7 @@ def segment_lineart(image_bgr: np.ndarray, params: LineArtParams) -> dict[str, A
             "zones": len(zones),
             "inference_seconds": round(elapsed_seconds, 4),
             "line_pixels": int(cv2.countNonZero(line_mask)),
+            "component_min_area_px": int(derived["component_min_area_px"]),
             **slic_metrics,
             **small_fragment_metrics,
         },

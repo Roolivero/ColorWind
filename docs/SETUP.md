@@ -102,8 +102,13 @@ Desde `processing-service`:
 
 ```bash
 cd /home/ro/Desktop/proyects/ColorWind/processing-service
-venv/bin/python -m uvicorn app.main:app --host 127.0.0.1 --port 8000
+venv/bin/python -m uvicorn app.main:app --host 127.0.0.1 --port 8000 --reload
 ```
+
+`--reload` es el modo recomendado para desarrollo local: si cambia codigo del
+backend, uvicorn reinicia la API automaticamente. Como el estado de proyectos
+del `processing-service` vive en memoria, esos `project_id` se pierden en cada
+reload.
 
 En el arranque debe aparecer algo como:
 

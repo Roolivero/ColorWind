@@ -10,17 +10,19 @@
   `processing-service/runtime/lineart-overlays/` cuando la llamada entra por
   la API, y en `processing-service/outputs/lineart-stage1/` para las pruebas
   manuales de esta etapa.
-- Etapa 3 implementada: las zonas grandes se subdividen con
-  `skimage.segmentation.slic`, limitado a la máscara de cada zona.
-- Etapa 4 implementada: las subzonas SLIC por debajo de `min_area_px` se
+- Etapa 3 implementada: las zonas grandes se subdividen con cortes curvos
+  internos sobre el polígono de cada región. SLIC queda disponible como
+  fallback técnico, pero no es la estrategia principal porque en pruebas
+  reales generó celdas demasiado hexagonales/Voronoi.
+- Etapa 4 implementada: las subzonas por debajo de `min_area_px` se
   intentan fusionar automáticamente con la vecina de mayor área del mismo
-  parent SLIC, usando la unión geométrica de `processing-service/app/geometry.py`.
+  parent de subdivisión, usando la unión geométrica de `processing-service/app/geometry.py`.
   Si una subzona no tiene vecino fusionable, queda reportada en métricas.
 - Etapa 5 implementada: para `mode="bw"`, `paint_number` se asigna con
   coloreo greedy de un grafo de adyacencias entre zonas, limitado por
   `num_colors`.
-- Etapas no implementadas todavía: posicionamiento avanzado con pole of
-  inaccessibility.
+- Posicionamiento avanzado con pole of inaccessibility implementado para
+  PDF/SVG numerado.
 
 ## 1. Diagnóstico
 
@@ -54,21 +56,28 @@ Pipeline para `mode: "bw"` (line-art):
    pintable queda en blanco) y correr `connectedComponentsWithStats` —
    esto da directamente las regiones encerradas por líneas, que es
    exactamente la estructura de una lámina de colorear.
-4. **Filtrado de ruido**: descartar componentes por debajo de un área
-   mínima (derivada de `detail_level` + tamaño de imagen). No se "borran"
-   sin más: se fusionan con la región vecina más cercana (reusando la
-   lógica de merge de la Fase 5), para no dejar huecos visuales.
+4. **Filtrado de ruido**: la detección inicial usa un umbral interno
+   permisivo (`component_min_area_px`) para no perder regiones reales del
+   dibujo. Ese umbral es más bajo que `min_area_px`, que se reserva para
+   decidir subdivisión/fusión y controlar el nivel de detalle. Esto evita
+   huecos blancos sin zona en láminas densas.
 5. **Subdivisión de regiones grandes**: cualquier región por encima de un
-   umbral de área se subdivide con **SLIC** (superpixels), limitado a la
-   máscara de esa región, con cantidad de celdas proporcional al área
-   (parámetro interno, no expuesto al usuario). Esto da la estética
-   "orgánica" típica de láminas comerciales, en vez de una grilla artificial.
+   umbral de área se subdivide con cortes curvos internos, generados sobre
+   el polígono de la región y proporcionales al área (parámetro interno, no
+   expuesto al usuario). Esto evita el patrón hexagonal/Voronoi que apareció
+   con SLIC y se acerca más a las curvas típicas de láminas comerciales.
 6. **Vectorización**: `findContours` sobre cada región final, simplificado
    con `approxPolyDP` o `shapely.simplify()`, para bordes limpios sin
    ruido de píxeles.
 7. **Asignación de `paint_number`**: cada zona geométrica (`zone_id`) recibe
    un número entre 1 y `num_colors` (ver sección 6).
-8. **Posicionamiento de números**: sobre cada zona final (ver sección 8).
+8. **Supresión de etiquetas en fragmentos chicos**: las zonas demasiado
+   chicas para sostener un número legible heredan el `paint_number` de una
+   zona cercana y se marcan con `suppress_label=true`. Siguen coloreadas y
+   forman parte del dibujo, pero no agregan un número propio que ensucie la
+   lámina.
+9. **Posicionamiento de números**: sobre cada zona final etiquetable (ver
+   sección 8).
 
 Este pipeline corre 100% en CPU — no depende de GPU, aunque esté disponible.
 
@@ -77,8 +86,9 @@ Este pipeline corre 100% en CPU — no depende de GPU, aunque esté disponible.
 | Técnica | Rol recomendado |
 |---|---|
 | Connected components / flood fill | **Motor principal** para extraer regiones cerradas. Simple, determinístico, rápido. Depende de que las líneas estén cerradas (por eso el paso de cierre morfológico previo). |
-| Watershed | Alternativa para el paso de subdivisión (semilla por distance transform), pero sin gradiente real (línea binaria) no aporta sobre SLIC. Se puede dejar como fallback si SLIC no está disponible. |
-| Superpixels (SLIC) | **Recomendado** para subdividir regiones grandes en celdas orgánicas de tamaño controlado. |
+| Cortes curvos con Shapely | **Motor principal actual** para subdividir regiones grandes en modo line-art. Produce bordes más parecidos a láminas comerciales que SLIC en imágenes reales. |
+| Watershed | Alternativa para el paso de subdivisión (semilla por distance transform), pero sin gradiente real (línea binaria) no aportó una ventaja clara. |
+| Superpixels (SLIC) | Fallback técnico disponible. En pruebas reales tendió a celdas hexagonales/Voronoi, por eso dejó de ser la estrategia principal. |
 | Superpixels (Felzenszwalb) | Mejor para segmentación natural de fotos a color (no da control fino de cantidad de celdas); no recomendado para este paso. |
 | Contour extraction | No es un método de segmentación en sí, es el paso de vectorización final — se usa siempre. |
 | SAM / FastSAM / MobileSAM | Se mantiene como motor para `mode: "color"` (fotos), donde sí hay señal semántica real. Se **descarta explícitamente** para `mode: "bw"`. |
@@ -88,7 +98,7 @@ Este pipeline corre 100% en CPU — no depende de GPU, aunque esté disponible.
 
 - **OpenCV**: binarización, morfología, `connectedComponentsWithStats`,
   `findContours`, `approxPolyDP`.
-- **scikit-image**: `skimage.segmentation.slic` (subdivisión), `skimage.measure.regionprops` (área/centroide).
+- **scikit-image**: `skimage.segmentation.slic` queda como fallback de subdivisión.
 - **Shapely**: construcción de polígonos, `simplify()`, `representative_point()`, y reuso de la lógica de unión de la Fase 5 para fusionar microzonas.
 - **NumPy**: soporte general de arrays.
 - **scipy.ndimage** (`distance_transform_edt`): para posicionamiento robusto de números (sección 8).
@@ -99,8 +109,9 @@ Este pipeline corre 100% en CPU — no depende de GPU, aunque esté disponible.
 **Expuestos al usuario**: `num_colors`, `detail_level`.
 
 **Internos, derivados de `detail_level`**: tamaño de kernel de cierre de
-líneas, área mínima de zona, tamaño objetivo de celda para SLIC, tolerancia
-de simplificación de polígonos.
+líneas, `component_min_area_px` para detectar regiones sin dejar huecos,
+`min_area_px` para subdivisión/fusión, tamaño objetivo de subzona curva y
+tolerancia de simplificación de polígonos.
 
 ## 6. Estrategia para `paint_number`
 
@@ -109,42 +120,47 @@ de simplificación de polígonos.
   `paint_number = cluster_id + 1`.
 - **Modo line-art (sin color de origen)**: no hay señal de color para
   agrupar. Se modela como un problema de **coloreo de grafos**: se arma un
-  grafo de adyacencia entre zonas (comparten borde), y se aplica un
-  algoritmo greedy de coloreo limitado a `num_colors` colores, priorizando
-  que zonas vecinas no compartan número. Si `num_colors` es muy chico
-  respecto a la cantidad de zonas, es esperable (y normal en láminas
-  comerciales) que haya colisiones entre zonas no contiguas — el objetivo
-  es minimizar colisiones entre vecinas directas, no eliminarlas del todo.
+  grafo de adyacencia entre zonas (comparten borde visual dentro de una
+  tolerancia de trazo), y se aplica un algoritmo greedy de coloreo limitado
+  a `num_colors` colores, priorizando que zonas vecinas no compartan número.
+  Si `num_colors` es muy chico respecto a la cantidad de zonas, es esperable
+  (y normal en láminas comerciales) que haya colisiones entre zonas no
+  contiguas — el objetivo es minimizar colisiones entre vecinas directas, no
+  eliminarlas del todo.
+- Las zonas por debajo del umbral de legibilidad de etiqueta heredan el
+  `paint_number` de una zona cercana y no muestran número propio. Esto evita
+  que texturas densas del line-art generen una nube de números dentro de una
+  misma zona visual.
 
 ## 7. Subdivisión de regiones grandes
 
-**SLIC** es la recomendación para la primera implementación: da celdas de
-área pareja y forma orgánica, ajustable por cantidad objetivo. Watershed
-con semillas por distance-transform es una alternativa válida si SLIC no
-rinde bien en la práctica, pero agrega complejidad (elegir semillas) sin
-beneficio claro sobre SLIC para este caso. Subdivisión por grilla regular
-se descarta: el resultado se ve artificial, no como una lámina comercial.
+La estrategia principal actual usa cortes curvos iterativos sobre las zonas
+grandes: se elige la pieza de mayor área y se intenta partirla con una línea
+curva hasta acercarse al nivel de detalle objetivo. SLIC queda como fallback,
+pero las pruebas visuales mostraron que tiende a un patrón hexagonal que no
+coincide con la estética buscada. Subdivisión por grilla regular se descarta:
+el resultado se ve artificial, no como una lámina comercial.
 
 ## 8. Posicionamiento de números
 
-Se mantiene `representative_point()` de Shapely como primer intento (ya
-implementado en Fase 6). Para zonas muy finas o cóncavas donde ese punto
-queda demasiado cerca del borde para que el número entre, la técnica
-estándar es el **"pole of inaccessibility"** (el punto más alejado posible
-de cualquier borde del polígono) — es el mismo algoritmo que usa Mapbox
-(librería `polylabel`) para ubicar etiquetas en mapas con formas
-irregulares. Se puede calcular con `scipy.ndimage.distance_transform_edt`
-sobre la máscara de la zona, tomando el píxel de máxima distancia al borde.
-Si ni así entra un número legible, se reduce el tamaño de fuente
-progresivamente (ya parcialmente resuelto en Fase 6).
+Implementado en `processing-service/app/pdf_export.py`: se mantiene
+`representative_point()` de Shapely como primer intento barato. Si el punto
+no queda dentro del polígono erosionado por el radio necesario para el
+número, se usa **"pole of inaccessibility"** (el punto más alejado posible
+de cualquier borde del polígono) calculado con
+`scipy.ndimage.distance_transform_edt` sobre la máscara de la zona. Si ni
+así entra un número legible, se reduce el tamaño de fuente progresivamente
+y se reportan métricas de placement para inspección.
 
 ## 9. Riesgos y mitigaciones
 
 - **Líneas abiertas**: el cierre morfológico previo lo resuelve, pero un
   kernel muy grande puede fusionar regiones que en realidad son distintas
   — requiere ajuste fino por `detail_level` y validación visual.
-- **Dibujos muy densos** (mandalas): pueden generar demasiadas microzonas
-  incluso antes de la subdivisión — mitigado por el filtro de área mínima.
+- **Dibujos muy densos** (mandalas o bosques con mucho detalle): pueden
+  generar muchas microzonas. Se prioriza no dejar regiones sin zona; la
+  densidad se controla después con `detail_level` y futuras reglas de
+  simplificación/fusión visual.
 - **Microzonas**: se fusionan con la vecina más cercana, no se descartan
   (descartarlas dejaría un hueco visual en el dibujo).
 - **Texto/firma/marca de agua**: puede tratarse como una región aislada más
@@ -167,19 +183,19 @@ progresivamente (ya parcialmente resuelto en Fase 6).
 2. **Filtrado de microzonas + cierre de gaps parametrizado por `detail_level`**.
    Hecho cuando: mover `detail_level` cambia visiblemente cantidad/tamaño
    de zonas sin deformar el dibujo.
-3. **Subdivisión con SLIC** de regiones grandes.
+3. **Subdivisión curva de regiones grandes**.
    Estado: implementado. Criterio interno actual: una zona se subdivide si
    supera un umbral derivado del área mediana de las zonas detectadas, el
    `min_area_px` derivado de `detail_level` y un multiplicador interno. La
-   cantidad de segmentos SLIC por zona es proporcional a su área y está
-   limitada por `slic_max_segments_per_zone`.
+   cantidad de subzonas por región es proporcional a su área y está limitada
+   por `slic_max_segments_per_zone` por compatibilidad interna de parámetros.
    Hecho cuando: una región grande queda partida en celdas orgánicas, sin
    patrón de grilla evidente.
 4. **Fusión de fragmentos chicos post-subdivisión** (reusando `geometry.py`
    de la Fase 5).
    Estado: implementado. Las fusiones internas usan `merge_zones()` con un
    `snap_tolerance` pequeño para absorber gaps de 1–2 px introducidos por la
-   vectorización de máscaras SLIC. Si una subzona no tiene vecino fusionable,
+   vectorización de subzonas. Si una subzona no tiene vecino fusionable,
    no se inventa una regla nueva: se deja en el resultado y se reporta en
    `small_fragment_unmerged_details`.
    Hecho cuando: no quedan zonas por debajo del área mínima tras subdividir,
@@ -188,13 +204,17 @@ progresivamente (ya parcialmente resuelto en Fase 6).
    del contrato de `/segment` para exponer `zone_id` y `paint_number` como
    campos separados.
    Estado: implementado para `mode="bw"`. Se construye un grafo de
-   adyacencias entre zonas finales post-SLIC/fusión, y se aplica un coloreo
-   greedy limitado a `num_colors`, priorizando que zonas vecinas no compartan
-   número. Con `num_colors=10`, las imágenes reales de validación generan
-   más de 150 zonas con `paint_number` en el rango 1-10.
+   adyacencias entre zonas finales post-subdivisión/fusión usando una tolerancia de
+   10 px para cubrir el grosor del trazo negro entre regiones pintables, y se
+   aplica un coloreo greedy limitado a `num_colors`, priorizando que zonas
+   vecinas no compartan número. Con `num_colors=10`, las imágenes reales de
+   validación generan más de 150 zonas con `paint_number` en el rango 1-10.
    Hecho cuando: con `num_colors=10` se generan 100-300 zonas con
    `paint_number` en el rango 1-10, sin romper la paleta existente.
 6. **Posicionamiento robusto de números** (pole of inaccessibility).
+   Estado: implementado en `pdf_export.py`. El PDF y el SVG numerado usan
+   `representative_point()` cuando alcanza, y fallback a distance transform
+   más reducción progresiva de fuente para zonas finas/cóncavas.
    Hecho cuando: ningún número queda cortado o fuera de su zona en el PDF,
    incluso en zonas finas/cóncavas.
 7. **Actualizar documentación** (`FUNCTIONAL_SPEC.md`, `API_CONTRACT.md`)

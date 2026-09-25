@@ -296,6 +296,8 @@ def zones_to_geojson(
         }
         if zone.get("requires_manual_color"):
             properties["requires_manual_color"] = True
+        if zone.get("suppress_label"):
+            properties["suppress_label"] = True
         features.append(
             {
                 "type": "Feature",
@@ -434,7 +436,12 @@ def segment(request: SegmentRequest) -> SegmentResponse:
     width = int(image_info["width"])
     height = int(image_info["height"])
     if request.mode == "bw":
-        zones, paint_number_metrics = assign_graph_paint_numbers(payload["zones"], num_colors)
+        label_min_area_px = float(payload.get("parameters", {}).get("min_area_px") or 0) * 1.2
+        zones, paint_number_metrics = assign_graph_paint_numbers(
+            payload["zones"],
+            num_colors,
+            label_min_area_px=label_min_area_px,
+        )
     else:
         zones = assign_paint_numbers(processing_image, payload["zones"], num_colors)
         paint_number_metrics = {
@@ -566,13 +573,15 @@ def export_pdf(request: ExportPdfRequest) -> Response:
         raise HTTPException(status_code=500, detail="Could not generate PDF") from exc
 
     project["numbered_svg"] = result.numbered_svg
+    project["pdf_placement_metrics"] = result.placement_metrics
     LOGGER.info(
-        "project_id=%s export_pdf paper=%s orientation=%s zones=%s seconds=%s",
+        "project_id=%s export_pdf paper=%s orientation=%s zones=%s seconds=%s placements=%s",
         request.project_id,
         request.paper_size,
         request.orientation,
         len(project["zones"]),
         result.elapsed_seconds,
+        result.placement_metrics,
     )
     return Response(
         content=result.pdf_bytes,

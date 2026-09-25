@@ -65,8 +65,12 @@ Levantar la API:
 
 ```bash
 cd processing-service
-venv/bin/python -m uvicorn app.main:app --host 127.0.0.1 --port 8000
+venv/bin/python -m uvicorn app.main:app --host 127.0.0.1 --port 8000 --reload
 ```
+
+`--reload` es para uso local/desarrollo: aplica cambios del backend sin
+reiniciar a mano. Cada reload reinicia el proceso, asi que se pierden los
+`project_id` guardados en memoria por el servicio.
 
 En los logs de arranque deberia aparecer:
 

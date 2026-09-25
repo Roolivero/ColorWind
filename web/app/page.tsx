@@ -39,6 +39,7 @@ type ZoneFeature = {
     area_px?: number;
     bbox?: number[];
     requires_manual_color?: boolean;
+    suppress_label?: boolean;
   };
   geometry: {
     type: "Polygon";
@@ -135,12 +136,33 @@ function fileToBase64(file: File): Promise<string> {
   });
 }
 
+function isAcceptedImageFile(file: File) {
+  const acceptedMimeTypes = ["image/jpeg", "image/png"];
+  const acceptedExtensions = [".jpg", ".jpeg", ".png"];
+  const fileName = file.name.toLowerCase();
+  return (
+    acceptedMimeTypes.includes(file.type) ||
+    acceptedExtensions.some((extension) => fileName.endsWith(extension))
+  );
+}
+
 function zoneId(feature: ZoneFeature, index: number) {
   return feature.properties?.zone_id ?? feature.id ?? String(index + 1);
 }
 
 function paintNumber(feature: ZoneFeature, index: number) {
   return feature.properties?.paint_number ?? zoneId(feature, index);
+}
+
+function shouldSuppressLabel(feature: ZoneFeature, imageWidth: number, imageHeight: number) {
+  if (feature.properties?.suppress_label) {
+    return true;
+  }
+  const area = feature.properties?.area_px ?? 0;
+  const bbox = feature.properties?.bbox ?? [];
+  const minBoxSide = Math.min(Number(bbox[2] ?? 0), Number(bbox[3] ?? 0));
+  const fallbackAreaThreshold = imageWidth * imageHeight * 0.0017;
+  return area > 0 && (area < fallbackAreaThreshold || minBoxSide < 14);
 }
 
 function numberKeys(count: number) {
@@ -297,6 +319,7 @@ function ZonesPreview({
   geojson,
   colors,
   view,
+  referenceUrl,
   editTool,
   selectedMergeZone,
   splitDraft,
@@ -306,6 +329,7 @@ function ZonesPreview({
   geojson: ZonesGeoJson;
   colors: ColorMap;
   view: "lines" | "color";
+  referenceUrl: string;
   editTool: EditTool;
   selectedMergeZone: string;
   splitDraft: SplitDraft | null;
@@ -342,18 +366,32 @@ function ZonesPreview({
       className="h-auto max-h-[70vh] w-full touch-none"
       viewBox={`0 0 ${width} ${height}`}
     >
+      {view === "lines" && referenceUrl ? (
+        <image
+          href={referenceUrl}
+          x={0}
+          y={0}
+          width={width}
+          height={height}
+          preserveAspectRatio="xMidYMid meet"
+          opacity={0.42}
+          pointerEvents="none"
+        />
+      ) : null}
       {geojson.features.map((feature, index) => {
         const id = zoneId(feature, index);
         const colorNumber = paintNumber(feature, index);
         const ring = feature.geometry.coordinates[0] ?? [];
         const isSelected = id === selectedMergeZone || id === splitDraft?.zoneId;
+        const zoneStroke = view === "lines" ? "#6f756d" : "#2f3934";
         return (
           <path
             key={`zone-${id}`}
             d={polygonPath(ring)}
             fill={view === "color" ? colors[colorNumber] ?? "#ffffff" : "transparent"}
-            stroke={isSelected ? "#d86f45" : "#111111"}
-            strokeWidth={isSelected ? 4 : 2}
+            stroke={isSelected ? "#d86f45" : zoneStroke}
+            strokeOpacity={isSelected ? 1 : view === "lines" ? 0.58 : 0.52}
+            strokeWidth={isSelected ? 4 : view === "lines" ? 1.15 : 1.25}
             vectorEffect="non-scaling-stroke"
             pointerEvents="all"
             className={disabled ? "cursor-wait" : editTool === "merge" ? "cursor-copy" : "cursor-crosshair"}
@@ -367,6 +405,19 @@ function ZonesPreview({
           />
         );
       })}
+      {view === "color" && referenceUrl ? (
+        <image
+          href={referenceUrl}
+          x={0}
+          y={0}
+          width={width}
+          height={height}
+          preserveAspectRatio="xMidYMid meet"
+          opacity={0.32}
+          pointerEvents="none"
+          style={{ mixBlendMode: "multiply" }}
+        />
+      ) : null}
       {splitDraft?.points[0] ? (
         <circle
           cx={splitDraft.points[0].x}
@@ -379,6 +430,9 @@ function ZonesPreview({
         />
       ) : null}
       {geojson.features.map((feature, index) => {
+        if (shouldSuppressLabel(feature, width, height)) {
+          return null;
+        }
         const id = zoneId(feature, index);
         const colorNumber = paintNumber(feature, index);
         const ring = feature.geometry.coordinates[0] ?? [];
@@ -394,8 +448,8 @@ function ZonesPreview({
             fontWeight={700}
             fill="#111111"
             paintOrder="stroke"
-            stroke="#ffffff"
-            strokeWidth={4}
+            stroke={view === "lines" ? "#f8faf5" : "#ffffff"}
+            strokeWidth={view === "lines" ? 3 : 4}
             pointerEvents="none"
           >
             {colorNumber}
@@ -412,7 +466,7 @@ export default function Home() {
   const [file, setFile] = useState<File | null>(null);
   const [imageBase64, setImageBase64] = useState("");
   const [referenceUrl, setReferenceUrl] = useState("");
-  const [mode, setMode] = useState<Mode>("color");
+  const [mode, setMode] = useState<Mode>("bw");
   const [numColors, setNumColors] = useState(12);
   const [detailLevel, setDetailLevel] = useState(0.5);
   const [result, setResult] = useState<SegmentResponse | null>(null);
@@ -425,6 +479,7 @@ export default function Home() {
   const [paletteWarning, setPaletteWarning] = useState("");
   const [paletteStatus, setPaletteStatus] = useState("");
   const [projectStatus, setProjectStatus] = useState("");
+  const [uploadStatus, setUploadStatus] = useState("");
   const [isLoading, setIsLoading] = useState(false);
   const [isSavingPalette, setIsSavingPalette] = useState(false);
   const [error, setError] = useState("");
@@ -539,8 +594,10 @@ export default function Home() {
   }
 
   async function acceptFile(nextFile: File) {
-    if (!["image/jpeg", "image/png"].includes(nextFile.type)) {
-      setError("Subi una imagen JPG o PNG.");
+    setUploadStatus(`Leyendo ${nextFile.name || "imagen"}...`);
+    if (!isAcceptedImageFile(nextFile)) {
+      setError(`Subi una imagen JPG o PNG. Archivo recibido: ${nextFile.name || "sin nombre"}.`);
+      setUploadStatus("");
       return;
     }
 
@@ -559,8 +616,11 @@ export default function Home() {
 
     try {
       setImageBase64(await fileToBase64(nextFile));
+      setUploadStatus("Imagen cargada.");
+      setProjectStatus("Imagen cargada. Lista para generar preview.");
     } catch (readError) {
       setImageBase64("");
+      setUploadStatus("");
       setError(readError instanceof Error ? readError.message : "No se pudo leer la imagen.");
     }
   }
@@ -572,7 +632,7 @@ export default function Home() {
     }
   }
 
-  function onDrop(event: DragEvent<HTMLButtonElement>) {
+  function onDrop(event: DragEvent<HTMLElement>) {
     event.preventDefault();
     setIsDragging(false);
     const nextFile = event.dataTransfer.files?.[0];
@@ -962,26 +1022,27 @@ export default function Home() {
         <section className="grid gap-5 xl:grid-cols-[340px_minmax(0,1fr)_330px]">
           <aside className="flex flex-col gap-4">
             <div className="rounded-lg border border-[var(--line)] bg-[var(--panel)] p-4 shadow-sm">
-              <input
-                ref={inputRef}
-                type="file"
-                accept="image/png,image/jpeg"
-                className="hidden"
-                onChange={onFileInput}
-              />
-              <button
-                type="button"
-                onClick={() => inputRef.current?.click()}
+              <div
                 onDragEnter={() => setIsDragging(true)}
                 onDragLeave={() => setIsDragging(false)}
                 onDragOver={(event) => event.preventDefault()}
                 onDrop={onDrop}
-                className={`flex min-h-52 w-full flex-col items-center justify-center gap-3 rounded-md border border-dashed p-5 text-center transition ${
+                className={`relative flex min-h-52 w-full flex-col items-center justify-center gap-3 overflow-hidden rounded-md border border-dashed p-5 text-center transition ${
                   isDragging
                     ? "border-[var(--accent)] bg-[var(--accent-soft)]"
                     : "border-[#aeb8a7] bg-[var(--panel-muted)] hover:border-[var(--accent)]"
                 }`}
               >
+                <input
+                  ref={inputRef}
+                  type="file"
+                  accept=".jpg,.jpeg,.png,image/jpeg,image/png"
+                  className="absolute inset-0 z-10 cursor-pointer opacity-0"
+                  onClick={(event) => {
+                    event.currentTarget.value = "";
+                  }}
+                  onChange={onFileInput}
+                />
                 <span className="flex size-11 items-center justify-center rounded-md bg-white text-[var(--accent-strong)] shadow-sm">
                   <ImagePlus size={24} aria-hidden="true" />
                 </span>
@@ -989,10 +1050,15 @@ export default function Home() {
                 <span className="text-sm leading-5 text-[#66705f]">
                   Arrastra una imagen o elegila desde el sistema.
                 </span>
-              </button>
+              </div>
               {file ? (
                 <div className="mt-3 rounded-md bg-[var(--panel-muted)] px-3 py-2 text-sm text-[#434a40]">
                   {file.name}
+                </div>
+              ) : null}
+              {uploadStatus ? (
+                <div className="mt-2 text-xs font-medium text-[var(--accent-strong)]">
+                  {uploadStatus}
                 </div>
               ) : null}
             </div>
@@ -1177,6 +1243,7 @@ export default function Home() {
                       geojson={result.zones_geojson}
                       colors={activePalette}
                       view={previewView === "color" ? "color" : "lines"}
+                      referenceUrl={referenceUrl}
                       editTool={editTool}
                       selectedMergeZone={selectedMergeZone}
                       splitDraft={splitDraft}

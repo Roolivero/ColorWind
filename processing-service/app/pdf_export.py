@@ -7,9 +7,12 @@ import math
 import time
 from typing import Any, Literal
 
+import cv2
+import numpy as np
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4, LETTER, landscape, portrait
 from reportlab.pdfgen import canvas
+from scipy.ndimage import distance_transform_edt
 from shapely.geometry import GeometryCollection, MultiPolygon, Point, Polygon
 from shapely.validation import make_valid
 
@@ -24,6 +27,9 @@ class LabelPlacement:
     x: float
     y: float
     font_size_image: float
+    method: str
+    clearance_px: float
+    required_radius_px: float
 
 
 @dataclass(frozen=True)
@@ -31,6 +37,7 @@ class PdfExport:
     pdf_bytes: bytes
     numbered_svg: str
     elapsed_seconds: float
+    placement_metrics: dict[str, Any]
 
 
 def _polygon_parts(geometry: Any) -> list[Polygon]:
@@ -60,13 +67,6 @@ def _paint_number(zone: dict[str, Any]) -> str:
     return str(zone.get("paint_number") or zone["id"])
 
 
-def _label_point(polygon: Polygon) -> Point:
-    centroid = polygon.centroid
-    if polygon.covers(centroid):
-        return centroid
-    return polygon.representative_point()
-
-
 def _label_font_size(zone: dict[str, Any], polygon: Polygon) -> float:
     bbox = zone.get("bbox") or [0, 0, 0, 0]
     bbox_width = max(float(bbox[2]), 1.0)
@@ -75,20 +75,148 @@ def _label_font_size(zone: dict[str, Any], polygon: Polygon) -> float:
     return max(5.0, min(28.0, area_size * 0.28, bbox_width * 0.55, bbox_height * 0.55))
 
 
+def _text_required_radius(paint_number: str, font_size: float) -> float:
+    # Conservative image-space estimate for a bold sans-serif label centered
+    # in the zone. A circle with this radius should contain the text box.
+    text_width = max(1, len(paint_number)) * font_size * 0.62
+    return max(2.0, math.hypot(text_width / 2, font_size * 0.48))
+
+
+def _point_clearance(polygon: Polygon, point: Point) -> float:
+    if polygon.is_empty or not polygon.covers(point):
+        return 0.0
+    return max(0.0, float(point.distance(polygon.boundary)))
+
+
+def _point_fits_label(polygon: Polygon, point: Point, required_radius: float) -> bool:
+    if required_radius <= 0:
+        return polygon.covers(point)
+    eroded = polygon.buffer(-required_radius)
+    if eroded.is_empty:
+        return False
+    return eroded.covers(point)
+
+
+def _pole_of_inaccessibility(polygon: Polygon, required_radius: float) -> tuple[Point, float]:
+    min_x, min_y, max_x, max_y = polygon.bounds
+    padding = max(3, int(math.ceil(required_radius)) + 2)
+    x0 = math.floor(min_x) - padding
+    y0 = math.floor(min_y) - padding
+    x1 = math.ceil(max_x) + padding
+    y1 = math.ceil(max_y) + padding
+    width = max(1, int(x1 - x0 + 1))
+    height = max(1, int(y1 - y0 + 1))
+
+    exterior = np.array(
+        [[int(round(x - x0)), int(round(y - y0))] for x, y in polygon.exterior.coords],
+        dtype=np.int32,
+    )
+    mask = np.zeros((height, width), dtype=np.uint8)
+    if len(exterior) >= 3:
+        cv2.fillPoly(mask, [exterior.reshape(-1, 1, 2)], 1)
+    for interior in polygon.interiors:
+        hole = np.array(
+            [[int(round(x - x0)), int(round(y - y0))] for x, y in interior.coords],
+            dtype=np.int32,
+        )
+        if len(hole) >= 3:
+            cv2.fillPoly(mask, [hole.reshape(-1, 1, 2)], 0)
+
+    if int(mask.max()) == 0:
+        point = polygon.representative_point()
+        return point, _point_clearance(polygon, point)
+
+    distances = distance_transform_edt(mask.astype(bool))
+    row, col = np.unravel_index(int(np.argmax(distances)), distances.shape)
+    point = Point(float(x0 + col), float(y0 + row))
+    if not polygon.covers(point):
+        point = polygon.representative_point()
+        return point, _point_clearance(polygon, point)
+    return point, float(distances[row, col])
+
+
+def _label_point(
+    polygon: Polygon,
+    paint_number: str,
+    font_size: float,
+) -> tuple[Point, str, float, float, float]:
+    required_radius = _text_required_radius(paint_number, font_size)
+    point = polygon.representative_point()
+    representative_clearance = _point_clearance(polygon, point)
+    if _point_fits_label(polygon, point, required_radius):
+        return point, "representative_point", representative_clearance, required_radius, font_size
+
+    pole, pole_clearance = _pole_of_inaccessibility(polygon, required_radius)
+    if pole_clearance + 0.001 >= required_radius:
+        return pole, "pole_of_inaccessibility", pole_clearance, required_radius, font_size
+
+    reduced_font_size = font_size
+    reduced_required_radius = required_radius
+    while reduced_font_size > 3.5:
+        reduced_font_size = max(3.5, reduced_font_size * 0.9)
+        reduced_required_radius = _text_required_radius(paint_number, reduced_font_size)
+        if pole_clearance + 0.001 >= reduced_required_radius:
+            return (
+                pole,
+                "pole_of_inaccessibility_reduced_font",
+                pole_clearance,
+                reduced_required_radius,
+                reduced_font_size,
+            )
+
+    return pole, "pole_of_inaccessibility_tight", pole_clearance, reduced_required_radius, reduced_font_size
+
+
 def label_placements(zones: list[dict[str, Any]]) -> list[LabelPlacement]:
     placements: list[LabelPlacement] = []
     for zone in zones:
+        if zone.get("suppress_label"):
+            continue
         polygon = _zone_polygon(zone)
-        point = _label_point(polygon)
+        paint_number = _paint_number(zone)
+        font_size = _label_font_size(zone, polygon)
+        point, method, clearance, required_radius, adjusted_font_size = _label_point(polygon, paint_number, font_size)
         placements.append(
             LabelPlacement(
                 zone_id=str(zone["id"]),
                 x=float(point.x),
                 y=float(point.y),
-                font_size_image=_label_font_size(zone, polygon),
+                font_size_image=adjusted_font_size,
+                method=method,
+                clearance_px=round(clearance, 3),
+                required_radius_px=round(required_radius, 3),
             )
         )
     return placements
+
+
+def placement_metrics(placements: list[LabelPlacement]) -> dict[str, Any]:
+    pole_count = sum(1 for placement in placements if placement.method.startswith("pole_of_inaccessibility"))
+    reduced_count = sum(1 for placement in placements if placement.method == "pole_of_inaccessibility_reduced_font")
+    tight_count = sum(
+        1
+        for placement in placements
+        if placement.clearance_px + 0.001 < placement.required_radius_px
+    )
+    return {
+        "placement_count": len(placements),
+        "representative_point_count": len(placements) - pole_count,
+        "pole_of_inaccessibility_count": pole_count,
+        "reduced_font_count": reduced_count,
+        "tight_label_count": tight_count,
+        "min_clearance_px": round(min((placement.clearance_px for placement in placements), default=0.0), 3),
+        "min_clearance_ratio": round(
+            min(
+                (
+                    placement.clearance_px / placement.required_radius_px
+                    for placement in placements
+                    if placement.required_radius_px > 0
+                ),
+                default=0.0,
+            ),
+            3,
+        ),
+    }
 
 
 def _polygon_path(points: list[list[int]]) -> str:
@@ -101,8 +229,16 @@ def _polygon_path(points: list[list[int]]) -> str:
     return " ".join(commands)
 
 
-def numbered_svg(width: int, height: int, zones: list[dict[str, Any]]) -> str:
-    placements = {placement.zone_id: placement for placement in label_placements(zones)}
+def numbered_svg(
+    width: int,
+    height: int,
+    zones: list[dict[str, Any]],
+    placements: list[LabelPlacement] | None = None,
+) -> str:
+    placement_map = {
+        placement.zone_id: placement
+        for placement in (placements if placements is not None else label_placements(zones))
+    }
     elements: list[str] = []
     for zone in zones:
         zone_id = str(zone["id"])
@@ -115,8 +251,10 @@ def numbered_svg(width: int, height: int, zones: list[dict[str, Any]]) -> str:
         )
     for zone in zones:
         zone_id = str(zone["id"])
+        if zone_id not in placement_map:
+            continue
         paint_number = _paint_number(zone)
-        placement = placements[zone_id]
+        placement = placement_map[zone_id]
         elements.append(
             f'<text x="{placement.x:.2f}" y="{placement.y:.2f}" text-anchor="middle" '
             f'dominant-baseline="central" font-size="{placement.font_size_image:.2f}" '
@@ -162,6 +300,7 @@ def _draw_drawing_page(
     image_width: int,
     image_height: int,
     zones: list[dict[str, Any]],
+    placements: list[LabelPlacement],
 ) -> None:
     margin = 36.0
     scale = min((page_width - margin * 2) / image_width, (page_height - margin * 2) / image_height)
@@ -169,7 +308,7 @@ def _draw_drawing_page(
     drawing_height = image_height * scale
     origin_x = (page_width - drawing_width) / 2
     origin_y = (page_height - drawing_height) / 2
-    placements = {placement.zone_id: placement for placement in label_placements(zones)}
+    placement_map = {placement.zone_id: placement for placement in placements}
 
     def transform(point: list[int]) -> tuple[float, float]:
         return origin_x + point[0] * scale, origin_y + (image_height - point[1]) * scale
@@ -192,8 +331,10 @@ def _draw_drawing_page(
     pdf.setFillColor(colors.black)
     for zone in zones:
         zone_id = str(zone["id"])
+        if zone_id not in placement_map:
+            continue
         paint_number = _paint_number(zone)
-        placement = placements[zone_id]
+        placement = placement_map[zone_id]
         x = origin_x + placement.x * scale
         y = origin_y + (image_height - placement.y) * scale
         bbox = zone.get("bbox") or [0, 0, 1, 1]
@@ -263,8 +404,9 @@ def generate_pdf(
     buffer = BytesIO()
     pdf = canvas.Canvas(buffer, pagesize=(page_width, page_height), pageCompression=1)
     pdf.setTitle("ColorWind pintar por numeros")
+    placements = label_placements(zones)
 
-    _draw_drawing_page(pdf, page_width, page_height, image_width, image_height, zones)
+    _draw_drawing_page(pdf, page_width, page_height, image_width, image_height, zones, placements)
     pdf.showPage()
     _draw_legend_page(pdf, page_width, page_height, zones, palette)
     pdf.showPage()
@@ -272,6 +414,7 @@ def generate_pdf(
 
     return PdfExport(
         pdf_bytes=buffer.getvalue(),
-        numbered_svg=numbered_svg(image_width, image_height, zones),
+        numbered_svg=numbered_svg(image_width, image_height, zones, placements),
         elapsed_seconds=round(time.perf_counter() - started, 4),
+        placement_metrics=placement_metrics(placements),
     )
